@@ -28,19 +28,37 @@ function saveConfig(cfg) {
 }
 
 // Non-interactive: setup add <name> <token> [description]
+//                  setup add-desktop <name> <accountName> [description]
 if (args[0] === "add" && args.length >= 3) {
   const [, name, token, ...descArgs] = args;
   const description = descArgs.join(" ").trim();
   const config = loadConfig() || {};
   if (!config.instances) config.instances = [];
   const existing = config.instances.findIndex((i) => i.name === name);
-  const instance = { name, token };
+  const instance = { name, authType: "serviceAccount", token };
   if (description) instance.description = description;
   if (existing >= 0) config.instances[existing] = instance;
   else config.instances.push(instance);
   if (!config.defaultInstance) config.defaultInstance = name;
   saveConfig(config);
-  console.log(`Instance "${name}" saved to ${configPath}`);
+  console.log(`Instance "${name}" saved to ${configPath} (serviceAccount)`);
+  process.exit(0);
+}
+
+if (args[0] === "add-desktop" && args.length >= 3) {
+  const [, name, accountName, ...descArgs] = args;
+  const description = descArgs.join(" ").trim();
+  const config = loadConfig() || {};
+  if (!config.instances) config.instances = [];
+  const existing = config.instances.findIndex((i) => i.name === name);
+  const instance = { name, authType: "desktop", accountName };
+  if (description) instance.description = description;
+  if (existing >= 0) config.instances[existing] = instance;
+  else config.instances.push(instance);
+  if (!config.defaultInstance) config.defaultInstance = name;
+  saveConfig(config);
+  console.log(`Instance "${name}" saved to ${configPath} (desktop: ${accountName})`);
+  console.log("Make sure the 1Password 8 desktop app is installed and the CLI integration is enabled (Settings → Developer → Connect with 1Password CLI).");
   process.exit(0);
 }
 
@@ -88,19 +106,33 @@ async function setup() {
     }
   }
 
-  console.log("To create a 1Password service account token:");
-  console.log("1. Go to https://start.1password.com/developer-tools/infrastructure-secrets/serviceaccount");
-  console.log("2. Create a service account and grant it access to the vaults you need");
-  console.log("3. Copy the token (starts with 'ops_')\n");
+  console.log("Pick auth mode:");
+  console.log("  1. Desktop app (recommended for personal use — uses 1Password 8 biometric unlock, full vault access)");
+  console.log("  2. Service account token (recommended for CI/shared — needs admin to provision, scoped vaults only)\n");
+  const mode = (await ask("Auth mode (1/2, default 1): ")).trim() || "1";
 
   const name = (await ask("Instance name (e.g., work): ")).trim();
-  const token = (await ask("Service account token: ")).trim();
   const description = (await ask("Description (optional): ")).trim();
 
   const config = existing || { instances: [] };
   if (!config.instances) config.instances = [];
   const idx = config.instances.findIndex((i) => i.name === name);
-  const instance = { name, token };
+  let instance;
+
+  if (mode === "2") {
+    console.log("\nCreate a service account token at:");
+    console.log("  https://start.1password.com/developer-tools/infrastructure-secrets/serviceaccount");
+    const token = (await ask("Service account token (ops_...): ")).trim();
+    instance = { name, authType: "serviceAccount", token };
+  } else {
+    console.log("\nYour 1Password account name can be found in the desktop app URL");
+    console.log("(e.g. 'my.1password.com' or the shorthand shown on the account switcher).\n");
+    console.log("IMPORTANT: Enable CLI integration in 1Password 8:");
+    console.log("  Settings → Developer → 'Connect with 1Password CLI'\n");
+    const accountName = (await ask("Account name (e.g., my.1password.com): ")).trim();
+    instance = { name, authType: "desktop", accountName };
+  }
+
   if (description) instance.description = description;
   if (idx >= 0) config.instances[idx] = instance;
   else config.instances.push(instance);

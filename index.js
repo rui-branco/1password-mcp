@@ -77,7 +77,10 @@ const rawConfig = fs.existsSync(configPath) ? loadConfigFile() : { instances: []
 
 let instances = (rawConfig.instances || []).map((i) => ({
   name: i.name,
+  // "serviceAccount" (default, needs ops_ token) or "desktop" (uses 1Password 8 app biometric unlock)
+  authType: i.authType || (i.token ? "serviceAccount" : "desktop"),
   token: i.token,
+  accountName: i.accountName,
   description: i.description || "",
 }));
 
@@ -105,11 +108,24 @@ async function getClient(instance) {
     );
   }
   if (clientCache.has(instance.name)) return clientCache.get(instance.name);
-  if (!instance.token) {
-    throw new Error(`Instance "${instance.name}" has no service account token.`);
+
+  let auth;
+  if (instance.authType === "desktop") {
+    if (!instance.accountName) {
+      throw new Error(
+        `Instance "${instance.name}" is desktop-auth but has no accountName. Re-run setup and provide your 1Password account (e.g. "my.1password.com" or "my").`,
+      );
+    }
+    auth = new sdk.DesktopAuth(instance.accountName);
+  } else {
+    if (!instance.token) {
+      throw new Error(`Instance "${instance.name}" has no service account token.`);
+    }
+    auth = instance.token;
   }
+
   const client = await sdk.createClient({
-    auth: instance.token,
+    auth,
     integrationName: INTEGRATION_NAME,
     integrationVersion: `v${PKG_VERSION}`,
   });
@@ -203,14 +219,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "op_add_instance",
         description:
-          "Add or update a 1Password service-account instance. Provide name + token (and optional description). Token is stored in ~/.config/1password-mcp/config.json with 0600 permissions.",
+          "Add or update a 1Password instance. Two auth modes: (1) 'serviceAccount' — provide token (ops_...). (2) 'desktop' — provide accountName (e.g. 'my.1password.com'); auth is delegated to the installed 1Password 8 desktop app via biometric unlock. Config is stored at ~/.config/1password-mcp/config.json with 0600 permissions.",
         inputSchema: {
           type: "object",
           properties: {
             name: { type: "string", description: "Unique name (e.g., 'work', 'personal')." },
+            authType: {
+              type: "string",
+              description: "'serviceAccount' (default) or 'desktop'.",
+            },
             token: {
               type: "string",
-              description: "1Password service account token (ops_... prefix).",
+              description: "Service account token (ops_...) — required for authType=serviceAccount.",
+            },
+            accountName: {
+              type: "string",
+              description: "1Password account (e.g. 'my.1password.com' or shorthand) — required for authType=desktop. Uses the logged-in 1Password 8 app.",
             },
             description: { type: "string", description: "Optional human-readable description." },
             setDefault: {
@@ -218,7 +242,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "Set this instance as the default (default: false).",
             },
           },
-          required: ["name", "token"],
+          required: ["name"],
         },
       },
       {
@@ -433,33 +457,67 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       for (const inst of instances) {
         const isDefault = inst.name === def ? " **(default)**" : "";
         const desc = inst.description ? ` - ${inst.description}` : "";
-        text += `- **${inst.name}**${isDefault}${desc}\n`;
+        const auth =
+          inst.authType === "desktop"
+            ? ` (desktop: ${inst.accountName})`
+            : " (serviceAccount)";
+        text += `- **${inst.name}**${isDefault}${auth}${desc}\n`;
       }
       return { content: [{ type: "text", text }] };
     }
 
     if (name === "op_add_instance") {
       const instName = args.name.trim();
-      if (!/^ops_[A-Za-z0-9_\-]+/.test(args.token)) {
+      const authType = args.authType || (args.token ? "serviceAccount" : "desktop");
+
+      if (authType === "serviceAccount") {
+        if (!args.token) {
+          return {
+            content: [{ type: "text", text: "serviceAccount authType requires a token." }],
+            isError: true,
+          };
+        }
+        if (!/^ops_[A-Za-z0-9_\-]+/.test(args.token)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Token does not look like a 1Password service account token (expected prefix 'ops_').",
+              },
+            ],
+            isError: true,
+          };
+        }
+      } else if (authType === "desktop") {
+        if (!args.accountName) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "desktop authType requires accountName (e.g. 'my.1password.com').",
+              },
+            ],
+            isError: true,
+          };
+        }
+      } else {
         return {
-          content: [
-            {
-              type: "text",
-              text: "Token does not look like a 1Password service account token (expected prefix 'ops_').",
-            },
-          ],
+          content: [{ type: "text", text: `Unknown authType "${authType}".` }],
           isError: true,
         };
       }
 
-      // Validate by creating a client and listing vaults.
+      // Validate by creating a client and listing one vault.
       try {
+        const probeAuth =
+          authType === "desktop"
+            ? new sdk.DesktopAuth(args.accountName)
+            : args.token;
         const tempClient = await sdk.createClient({
-          auth: args.token,
+          auth: probeAuth,
           integrationName: INTEGRATION_NAME,
           integrationVersion: `v${PKG_VERSION}`,
         });
-        // consume iterator to force a real API call
         const probe = [];
         for await (const v of await tempClient.vaults.list()) {
           probe.push(v);
@@ -467,16 +525,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       } catch (e) {
         return {
-          content: [
-            { type: "text", text: `Token validation failed: ${e.message}` },
-          ],
+          content: [{ type: "text", text: `Auth validation failed: ${e.message}` }],
           isError: true,
         };
       }
 
       const newInst = {
         name: instName,
-        token: args.token,
+        authType,
+        token: authType === "serviceAccount" ? args.token : undefined,
+        accountName: authType === "desktop" ? args.accountName : undefined,
         description: args.description || "",
       };
       const existingIdx = instances.findIndex((i) => i.name === instName);
@@ -487,7 +545,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const savedConfig = loadConfigFile();
       if (!savedConfig.instances) savedConfig.instances = [];
       const savedIdx = savedConfig.instances.findIndex((i) => i.name === instName);
-      const toSave = { name: instName, token: args.token };
+      const toSave = { name: instName, authType };
+      if (authType === "serviceAccount") toSave.token = args.token;
+      if (authType === "desktop") toSave.accountName = args.accountName;
       if (args.description) toSave.description = args.description;
       if (savedIdx >= 0) savedConfig.instances[savedIdx] = toSave;
       else savedConfig.instances.push(toSave);
@@ -500,7 +560,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `${existingIdx >= 0 ? "Updated" : "Added"} instance "${instName}".${args.setDefault ? " Set as default." : ""}`,
+            text: `${existingIdx >= 0 ? "Updated" : "Added"} instance "${instName}" (${authType}).${args.setDefault ? " Set as default." : ""}`,
           },
         ],
       };

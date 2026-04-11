@@ -24,7 +24,7 @@
   "author": "Rui Branco",
   "license": "MIT",
   "dependencies": {
-    "@1password/sdk": "^0.3.1",
+    "@1password/sdk": "^0.4.0",
     "@modelcontextprotocol/sdk": "^1.25.3"
   }
 }
