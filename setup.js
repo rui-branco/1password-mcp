@@ -125,12 +125,65 @@ async function setup() {
     const token = (await ask("Service account token (ops_...): ")).trim();
     instance = { name, authType: "serviceAccount", token };
   } else {
-    console.log("\nYour 1Password account name can be found in the desktop app URL");
-    console.log("(e.g. 'my.1password.com' or the shorthand shown on the account switcher).\n");
-    console.log("IMPORTANT: Enable CLI integration in 1Password 8:");
-    console.log("  Settings → Developer → 'Connect with 1Password CLI'\n");
+    console.log("\n=== One-time 1Password 8 setup (required for desktop auth) ===");
+    console.log("");
+    console.log("Open the 1Password 8 desktop app (not the browser — the Mac/Windows app).");
+    console.log("");
+    console.log("  1. Open Settings (cmd+, on Mac / ctrl+, on Windows)");
+    console.log("  2. Click the 'Developer' tab on the left");
+    console.log("  3. Tick 'Integrate with 1Password CLI'");
+    console.log("     (under 'Command-Line Interface (CLI)')");
+    console.log("  4. Tick 'Integrate with other apps'");
+    console.log("     (under 'Integrate with the 1Password SDKs')");
+    console.log("     ** THIS IS THE KEY ONE — without it the SDK can't unlock. **");
+    console.log("  5. (Optional) Settings → Security → 'Unlock using Touch ID'");
+    console.log("");
+    console.log("The first time the MCP calls 1Password you'll get a system prompt");
+    console.log("asking to authorize '1password-mcp' — click Approve.");
+    console.log("");
+    console.log("=== Finding your account name ===");
+    console.log("");
+    console.log("Open 1Password 8 → click the account switcher in the top-left.");
+    console.log("The signin address shown next to your name is what you want here,");
+    console.log("e.g. 'my.1password.com' or 'my-team.1password.com'.");
+    console.log("");
     const accountName = (await ask("Account name (e.g., my.1password.com): ")).trim();
+    if (!accountName) {
+      console.error("Account name is required. Aborting.");
+      rl.close();
+      process.exit(1);
+    }
     instance = { name, authType: "desktop", accountName };
+
+    // Validate by actually trying to talk to the desktop app. This will pop the
+    // OS-level authorization prompt on first use.
+    console.log("\nValidating with 1Password desktop app (you may get an auth prompt)…");
+    try {
+      const sdk = require("@1password/sdk");
+      const client = await sdk.createClient({
+        auth: new sdk.DesktopAuth(accountName),
+        integrationName: "1password-mcp-setup",
+        integrationVersion: "v1",
+      });
+      const probe = [];
+      for await (const v of await client.vaults.list()) {
+        probe.push(v);
+        if (probe.length >= 1) break;
+      }
+      console.log(`Validated. Saw vault: ${probe[0]?.title || "(none visible)"}.`);
+    } catch (e) {
+      console.error("");
+      console.error("Validation failed: " + e.message);
+      console.error("");
+      console.error("Common causes:");
+      console.error("  - 'Integrate with other apps' is NOT ticked in 1Password Settings → Developer");
+      console.error("  - 1Password 8 desktop app is not running or locked");
+      console.error("  - Account name is wrong (check the account switcher in 1Password 8)");
+      console.error("");
+      console.error("Fix the issue and re-run this setup.");
+      rl.close();
+      process.exit(1);
+    }
   }
 
   if (description) instance.description = description;

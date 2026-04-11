@@ -16,33 +16,44 @@ Built to mirror the multi-instance pattern of [jira-mcp](https://github.com/rui-
 ### Prerequisites
 
 - Node.js 18+
-- A 1Password account with permission to create [service accounts](https://developer.1password.com/docs/service-accounts/)
+- Either:
+  - **The 1Password 8 desktop app** (recommended — no admin permissions needed, and you get access to all vaults you can already see), or
+  - A 1Password **service account** token (needs admin to provision, scoped to shared vaults only — good for CI/headless use)
 
-### Step 1: Create a service account token
-
-1. Go to <https://start.1password.com/developer-tools/infrastructure-secrets/serviceaccount>
-2. Create a service account and grant it access to the vaults you want to use
-3. Copy the token — it starts with `ops_`
-
-### Step 2: Configure
+### Step 1: Install and register the MCP
 
 ```bash
-node $HOME/WebstormProjects/1password-mcp/setup.js
+claude mcp add --scope user --transport stdio 1password -- npx -y @rui.branco/1password-mcp
 ```
 
-Or non-interactively:
+### Step 2: Run setup
 
 ```bash
-node $HOME/WebstormProjects/1password-mcp/setup.js add work ops_ABC... "ITO service account"
+npx @rui.branco/1password-mcp setup
 ```
 
-### Step 3: Add to Claude Code
+The setup wizard walks you through picking an auth mode and validates the connection before saving.
 
-```bash
-claude mcp add --transport stdio 1password -- node $HOME/WebstormProjects/1password-mcp/index.js
-```
+### Step 3 (desktop auth only): One-time 1Password 8 toggles
 
-Restart Claude Code and run `/mcp` to verify.
+Desktop auth delegates unlock to the 1Password 8 desktop app, so you need to enable the SDK integration **once** per machine:
+
+1. Open the **1Password 8 desktop app** (not `my.1password.com` in the browser).
+2. Open **Settings** (cmd+, on Mac / ctrl+, on Windows).
+3. Click the **Developer** tab.
+4. Under *Command-Line Interface (CLI)*, tick **"Integrate with 1Password CLI"**.
+5. Under *Integrate with the 1Password SDKs*, tick **"Integrate with other apps"**. ← **This is the critical one.** Without it, the SDK cannot unlock and every call will fail with `DesktopSessionExpiredError`.
+6. Optional: **Settings → Security → Unlock using Touch ID** so the OS prompt can be cleared with your fingerprint.
+
+The first time the MCP actually calls 1Password, your OS will pop an authorization prompt asking whether `1password-mcp-setup` (during the wizard) and `1password-mcp` (at runtime) can talk to 1Password. Click Approve.
+
+### Finding your account name
+
+When the wizard asks for "Account name", open the 1Password 8 desktop app and click the **account switcher** in the top-left. The signin address shown next to your name is what you want — it looks like `my.1password.com`, `my-team.1password.com`, or similar.
+
+### Step 4: Reconnect
+
+Run `/mcp` in Claude Code to reconnect the 1password server and pick up the new config.
 
 ## Tools
 
