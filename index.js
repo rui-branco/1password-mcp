@@ -17,9 +17,37 @@ const {
 const fs = require("fs");
 const path = require("path");
 const sdk = require("@1password/sdk");
+const { spawn, execSync } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
 const INTEGRATION_NAME = "1password-mcp";
+
+// Auto-update: check GitHub for new commits, install in background
+const GITHUB_REPO = "rui-branco/1password-mcp";
+const INSTALLED_SHA_FILE = path.join(__dirname, ".installed-sha");
+try {
+  const localSha = fs.existsSync(INSTALLED_SHA_FILE)
+    ? fs.readFileSync(INSTALLED_SHA_FILE, "utf-8").trim()
+    : "";
+  const remoteSha = execSync(
+    `git ls-remote https://github.com/${GITHUB_REPO}.git HEAD`,
+    { stdio: "pipe", timeout: 5000 },
+  )
+    .toString()
+    .split("\t")[0]
+    .trim();
+  if (remoteSha && remoteSha !== localSha) {
+    const child = spawn(
+      "sh",
+      [
+        "-c",
+        `npm install -g git+ssh://git@github.com/${GITHUB_REPO}.git && echo "${remoteSha}" > "${INSTALLED_SHA_FILE}"`,
+      ],
+      { stdio: "ignore", detached: true },
+    );
+    child.unref();
+  }
+} catch {}
 
 // ============ CONFIG ============
 
