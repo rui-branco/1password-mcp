@@ -522,22 +522,22 @@ const TOOL_DEFINITIONS = [
   {
     name: "op_update_item",
     description:
-      "Update an existing item. Patch fields by title — e.g. to change the password on 'GitHub', pass fields: [{title: 'password', value: 'new-pwd'}]. To add a new field, include its type. Omitting fields leaves them untouched. Can also rename the item (title) or replace its tags.",
+      "Update any part of an existing item — title, category, fields, tags, websites, sections, or notes. Omitted parameters are preserved. Fields are patched by title (existing fields match case-insensitively; new fields require `type`). Tags, websites, and sections are REPLACED when passed.",
     inputSchema: {
       type: "object",
       properties: {
         vault: { type: "string", description: "Vault id or title." },
         item: { type: "string", description: "Item id or title to update." },
         title: { type: "string", description: "New title (optional)." },
-        tags: {
-          type: "array",
-          items: { type: "string" },
-          description: "Replace the item's tag list (optional).",
+        category: {
+          type: "string",
+          description:
+            "New category (rare). One of Login, SecureNote, Password, ApiCredentials, Database, Server, Email, Identity, CreditCard, etc.",
         },
         fields: {
           type: "array",
           description:
-            "Field patches: [{title, value, type?, sectionId?}]. Existing fields are matched by title (case-insensitive) and their values replaced. New fields require `type`.",
+            "Field patches: [{title, value, type?, sectionId?}]. Existing fields matched by title have their values replaced. New fields require `type` (Text | Concealed | Totp | Email | Url | Phone).",
           items: {
             type: "object",
             properties: {
@@ -548,6 +548,46 @@ const TOOL_DEFINITIONS = [
             },
             required: ["title", "value"],
           },
+        },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Replace the tag list. Omit to preserve existing tags; pass [] to clear.",
+        },
+        websites: {
+          type: "array",
+          description:
+            "Replace the website list. Each website is {url, label?, autofillBehavior?}. Omit to preserve existing websites.",
+          items: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+              label: { type: "string" },
+              autofillBehavior: {
+                type: "string",
+                description: "'AnywhereOnWebsite' (default) or 'Never'.",
+              },
+            },
+            required: ["url"],
+          },
+        },
+        sections: {
+          type: "array",
+          description: "Replace the section list. Each section is {title, id?}.",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              id: { type: "string" },
+            },
+            required: ["title"],
+          },
+        },
+        notes: {
+          type: "string",
+          description:
+            "Replace the notesPlain field. Omit to preserve existing notes.",
         },
         instance: {
           type: "string",
@@ -952,43 +992,80 @@ async function updateItemHandler(args) {
   const current = await client.items.get(vault.id, itemRef.id);
   const updated = { ...current };
 
+  // --- title (rename) ---
   if (args.title) updated.title = args.title;
+
+  // --- category (rarely changed, but the SDK allows it) ---
+  if (args.category) {
+    const cat = sdk.ItemCategory[args.category];
+    if (!cat) throw new Error(`Unknown category "${args.category}".`);
+    updated.category = cat;
+  }
+
+  // --- tags (replace when passed; preserved when omitted) ---
   if (args.tags) updated.tags = args.tags;
 
-  if (Array.isArray(args.fields) && args.fields.length > 0) {
-    const existing = current.fields || [];
-    const patchesByTitle = new Map(
-      args.fields.map((p) => [p.title.toLowerCase(), p]),
-    );
-
-    // Patch existing fields in place, preserving id/type/sectionId
-    const patchedExisting = existing.map((f) => {
-      const patch = patchesByTitle.get((f.title || "").toLowerCase());
-      if (!patch) return f;
-      patchesByTitle.delete((f.title || "").toLowerCase());
-      return { ...f, value: patch.value };
-    });
-
-    // Remaining patches = new fields to add (must specify type)
-    const additions = [];
-    for (const patch of patchesByTitle.values()) {
-      if (!patch.type) {
-        throw new Error(
-          `Field "${patch.title}" doesn't exist on the item — pass a 'type' to add it as a new field.`,
-        );
-      }
-      const ft = sdk.ItemFieldType[patch.type];
-      if (!ft) throw new Error(`Unknown field type "${patch.type}".`);
-      additions.push({
-        id: patch.title.toLowerCase().replace(/\s+/g, "_"),
-        title: patch.title,
-        fieldType: ft,
-        value: patch.value,
-        sectionId: patch.sectionId,
-      });
-    }
-    updated.fields = [...patchedExisting, ...additions];
+  // --- websites (replace when passed; preserved when omitted) ---
+  if (Array.isArray(args.websites)) {
+    updated.websites = args.websites.map((w) => ({
+      url: w.url,
+      label: w.label || "website",
+      autofillBehavior:
+        w.autofillBehavior === "Never"
+          ? sdk.AutofillBehavior.Never
+          : sdk.AutofillBehavior.AnywhereOnWebsite,
+    }));
   }
+
+  // --- sections (replace when passed; preserved when omitted) ---
+  if (Array.isArray(args.sections)) {
+    updated.sections = args.sections.map((s) => ({
+      id: s.id || s.title.toLowerCase().replace(/\s+/g, "_"),
+      title: s.title,
+    }));
+  }
+
+  // --- fields (patch by title, add new ones with explicit type) ---
+  const nextFields = [...(current.fields || [])];
+  const fieldIndexByTitle = new Map(
+    nextFields.map((f, idx) => [(f.title || "").toLowerCase(), idx]),
+  );
+
+  function upsertField({ title, value, type, sectionId }) {
+    const key = title.toLowerCase();
+    const existingIdx = fieldIndexByTitle.get(key);
+    if (existingIdx !== undefined) {
+      nextFields[existingIdx] = { ...nextFields[existingIdx], value };
+      return;
+    }
+    if (!type) {
+      throw new Error(
+        `Field "${title}" doesn't exist on the item — pass a 'type' to add it as a new field.`,
+      );
+    }
+    const ft = sdk.ItemFieldType[type];
+    if (!ft) throw new Error(`Unknown field type "${type}".`);
+    const added = {
+      id: title.toLowerCase().replace(/\s+/g, "_"),
+      title,
+      fieldType: ft,
+      value,
+    };
+    if (sectionId) added.sectionId = sectionId;
+    fieldIndexByTitle.set(key, nextFields.length);
+    nextFields.push(added);
+  }
+
+  if (Array.isArray(args.fields)) {
+    for (const patch of args.fields) upsertField(patch);
+  }
+
+  // --- notes: stored as a 'notesPlain' Text field, so patch it the same way ---
+  if (args.notes !== undefined) {
+    upsertField({ title: "notesPlain", value: args.notes, type: "Text" });
+  }
+
+  updated.fields = nextFields;
 
   const result = await client.items.put(updated);
   return `Updated item "${result.title}" (id: ${result.id}) in vault "${vault.title}".`;
