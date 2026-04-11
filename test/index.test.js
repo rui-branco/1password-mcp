@@ -65,13 +65,19 @@ const {
   TOOL_DEFINITIONS,
   HANDLERS,
   generatePasswordHandler,
+  searchItemsHandler,
+  searchItems,
 } = require("../index.js");
 
 // ---------------------------------------------------------------------------
 // Fake 1Password client for resolver tests
 // ---------------------------------------------------------------------------
 
-function makeFakeClient({ vaults = [], itemsByVault = {} } = {}) {
+function makeFakeClient({
+  vaults = [],
+  itemsByVault = {},
+  fullItemsById = {},
+} = {}) {
   return {
     vaults: {
       list: async () =>
@@ -84,6 +90,11 @@ function makeFakeClient({ vaults = [], itemsByVault = {} } = {}) {
         (async function* () {
           for (const i of itemsByVault[vaultId] || []) yield i;
         })(),
+      get: async (vaultId, itemId) => {
+        const full = fullItemsById[itemId];
+        if (!full) throw new Error(`item ${itemId} not found`);
+        return full;
+      },
     },
   };
 }
@@ -391,6 +402,89 @@ describe("formatItem", () => {
 // generatePasswordHandler — exercises the real SDK generator (pure function,
 // does not talk to 1Password).
 // ---------------------------------------------------------------------------
+
+describe("searchItems", () => {
+  const vaults = [
+    { id: "v1", title: "Private" },
+    { id: "v2", title: "42-ITO.Share" },
+  ];
+  const itemsByVault = {
+    v1: [{ id: "i0", title: "Personal Wifi", category: "Login" }],
+    v2: [
+      { id: "i1", title: "Door Entrance Office", category: "Password" },
+      { id: "i2", title: "Door Entrance Garage", category: "Password" },
+      { id: "i3", title: "42-ITO WiFi", category: "Login" },
+    ],
+  };
+  const fullItemsById = {
+    i1: {
+      id: "i1",
+      title: "Door Entrance Office",
+      category: "Password",
+      fields: [
+        {
+          id: "password",
+          title: "password",
+          fieldType: "Concealed",
+          value: "52007",
+        },
+      ],
+      websites: [],
+    },
+    i2: {
+      id: "i2",
+      title: "Door Entrance Garage",
+      category: "Password",
+      fields: [
+        {
+          id: "password",
+          title: "password",
+          fieldType: "Concealed",
+          value: "93175",
+        },
+      ],
+      websites: [],
+    },
+  };
+
+  const client = makeFakeClient({ vaults, itemsByVault, fullItemsById });
+
+  it("list mode returns a bullet list without secret values", async () => {
+    const out = await searchItems(client, { query: "door" });
+    assert.match(out, /# Search: "door" \(2\)/);
+    assert.match(out, /Door Entrance Office/);
+    assert.match(out, /Door Entrance Garage/);
+    assert.ok(!out.includes("52007"));
+    assert.ok(!out.includes("93175"));
+  });
+
+  it("reveal mode returns full field values in one call", async () => {
+    const out = await searchItems(client, { query: "door", reveal: true });
+    assert.match(out, /# Search \(revealed\): "door" \(2\)/);
+    assert.match(out, /## Door Entrance Office/);
+    assert.match(out, /## Door Entrance Garage/);
+    assert.ok(out.includes("52007"), "office password should be revealed");
+    assert.ok(out.includes("93175"), "garage password should be revealed");
+  });
+
+  it("scopes search to a single vault when vault is passed", async () => {
+    const out = await searchItems(client, { query: "wifi", vault: "Private" });
+    assert.match(out, /Personal Wifi/);
+    assert.ok(!out.includes("42-ITO WiFi"));
+  });
+
+  it("returns zero-match message when nothing matches", async () => {
+    const out = await searchItems(client, { query: "nothinghere" });
+    assert.match(out, /No items matched "nothinghere"\./);
+  });
+
+  it("throws when vault filter resolves to nothing", async () => {
+    await assert.rejects(
+      () => searchItems(client, { query: "x", vault: "doesnotexist" }),
+      /not found/,
+    );
+  });
+});
 
 describe("generatePasswordHandler", () => {
   it("generates a Random password of the requested length", () => {

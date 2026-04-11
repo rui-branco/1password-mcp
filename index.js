@@ -361,7 +361,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "op_search_items",
     description:
-      "Search items by title across vaults. If `vault` is omitted, searches every vault the account can see.",
+      "Search items by title across vaults. When the user asks for a specific credential by name (e.g. 'give me the wifi password', 'what's my GitHub login'), call this with `reveal: true` to get the password/credential values back in a single call — no follow-up op_get_item needed. If `vault` is omitted, searches every vault the account can see. When there are 1–5 matches with reveal=true, return all of them; the user already consented to seeing concealed values by asking for them.",
     inputSchema: {
       type: "object",
       properties: {
@@ -375,7 +375,12 @@ const TOOL_DEFINITIONS = [
         },
         limit: {
           type: "number",
-          description: "Max results (default 25).",
+          description: "Max results (default 25, or 5 when reveal=true to avoid fetching too many items).",
+        },
+        reveal: {
+          type: "boolean",
+          description:
+            "If true, fetch each match's full item and return concealed field values (passwords, TOTPs) in cleartext. Use this when the user is asking for a credential by name — one call gets search + retrieval + reveal. Defaults to false.",
         },
         instance: {
           type: "string",
@@ -512,6 +517,65 @@ const TOOL_DEFINITIONS = [
         },
       },
       required: ["vault", "title"],
+    },
+  },
+  {
+    name: "op_update_item",
+    description:
+      "Update an existing item. Patch fields by title — e.g. to change the password on 'GitHub', pass fields: [{title: 'password', value: 'new-pwd'}]. To add a new field, include its type. Omitting fields leaves them untouched. Can also rename the item (title) or replace its tags.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        vault: { type: "string", description: "Vault id or title." },
+        item: { type: "string", description: "Item id or title to update." },
+        title: { type: "string", description: "New title (optional)." },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description: "Replace the item's tag list (optional).",
+        },
+        fields: {
+          type: "array",
+          description:
+            "Field patches: [{title, value, type?, sectionId?}]. Existing fields are matched by title (case-insensitive) and their values replaced. New fields require `type`.",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              value: { type: "string" },
+              type: { type: "string" },
+              sectionId: { type: "string" },
+            },
+            required: ["title", "value"],
+          },
+        },
+        instance: {
+          type: "string",
+          description: "Instance name. Uses default if omitted.",
+        },
+      },
+      required: ["vault", "item"],
+    },
+  },
+  {
+    name: "op_update_vault",
+    description:
+      "Update a vault's title and/or description. Pass at least one of them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        vault: { type: "string", description: "Vault id or title." },
+        title: { type: "string", description: "New title (optional)." },
+        description: {
+          type: "string",
+          description: "New description (optional).",
+        },
+        instance: {
+          type: "string",
+          description: "Instance name. Uses default if omitted.",
+        },
+      },
+      required: ["vault"],
     },
   },
   {
@@ -709,15 +773,19 @@ async function listItemsHandler(args) {
   return `# Items in ${vault.title} (${items.length})\n\n${lines.join("\n")}`;
 }
 
-async function searchItemsHandler(args) {
-  const client = await getClient(getInstanceByName(args.instance));
-  const limit = args.limit || 25;
-  const q = String(args.query).toLowerCase();
+/**
+ * Core search implementation — pulled out of the handler so it can be unit
+ * tested with a fake client. Accepts an already-resolved client.
+ */
+async function searchItems(client, { query, vault, reveal, limit }) {
+  const wantReveal = !!reveal;
+  const max = limit || (wantReveal ? 5 : 25);
+  const q = String(query).toLowerCase();
 
   let targetVaults;
-  if (args.vault) {
-    const v = await resolveVault(client, args.vault);
-    if (!v) throw new Error(`Vault "${args.vault}" not found.`);
+  if (vault) {
+    const v = await resolveVault(client, vault);
+    if (!v) throw new Error(`Vault "${vault}" not found.`);
     targetVaults = [v];
   } else {
     targetVaults = await collect(await client.vaults.list());
@@ -727,19 +795,66 @@ async function searchItemsHandler(args) {
   for (const v of targetVaults) {
     for await (const it of await client.items.list(v.id)) {
       if ((it.title || "").toLowerCase().includes(q)) {
-        hits.push({ ...it, _vaultTitle: v.title });
-        if (hits.length >= limit) break;
+        hits.push({ ...it, _vaultId: v.id, _vaultTitle: v.title });
+        if (hits.length >= max) break;
       }
     }
-    if (hits.length >= limit) break;
+    if (hits.length >= max) break;
   }
 
-  if (hits.length === 0) return `No items matched "${args.query}".`;
-  const lines = hits.map(
-    (it) =>
-      `- **${it.title}** (id: ${it.id}, vault: ${it._vaultTitle}, category: ${it.category})`,
+  if (hits.length === 0) return `No items matched "${query}".`;
+
+  if (!wantReveal) {
+    const lines = hits.map(
+      (it) =>
+        `- **${it.title}** (id: ${it.id}, vault: ${it._vaultTitle}, category: ${it.category})`,
+    );
+    return `# Search: "${query}" (${hits.length})\n\n${lines.join("\n")}`;
+  }
+
+  // reveal=true: fetch each hit's full item in parallel and render every
+  // field (including concealed values). One-shot path for "give me the X
+  // credential" style queries.
+  const full = await Promise.all(
+    hits.map(async (it) => {
+      try {
+        const item = await client.items.get(it._vaultId, it.id);
+        return { item, _vaultTitle: it._vaultTitle, _error: null };
+      } catch (e) {
+        return { item: it, _vaultTitle: it._vaultTitle, _error: e.message };
+      }
+    }),
   );
-  return `# Search: "${args.query}" (${hits.length})\n\n${lines.join("\n")}`;
+
+  const sections = full.map((entry) => {
+    if (entry._error) {
+      return `## ${entry.item.title}\n\n_Failed to fetch: ${entry._error}_`;
+    }
+    const it = entry.item;
+    const fields = (it.fields || [])
+      .map((f) => redactField(f, true))
+      .filter((f) => f.value !== undefined && f.value !== "");
+    const fieldLines = fields.length
+      ? fields
+          .map((f) => {
+            const otp = f.otp ? ` (OTP now: ${f.otp})` : "";
+            return `- **${f.title}** (${f.type}): ${f.value}${otp}`;
+          })
+          .join("\n")
+      : "_(no fields)_";
+    const websites = (it.websites || []).map((w) => w.url).filter(Boolean);
+    const websiteLine = websites.length
+      ? `- **URLs:** ${websites.join(", ")}\n`
+      : "";
+    return `## ${it.title} (${it.category})\n\n- **Vault:** ${entry._vaultTitle}\n- **Item ID:** ${it.id}\n${websiteLine}\n${fieldLines}`;
+  });
+
+  return `# Search (revealed): "${query}" (${hits.length})\n\n${sections.join("\n\n")}`;
+}
+
+async function searchItemsHandler(args) {
+  const client = await getClient(getInstanceByName(args.instance));
+  return searchItems(client, args);
 }
 
 async function getItemHandler(args) {
@@ -821,6 +936,76 @@ function generatePasswordHandler(args) {
   const pwd =
     typeof generated === "string" ? generated : generated.password || generated;
   return `Generated (${type}):\n${pwd}`;
+}
+
+async function updateItemHandler(args) {
+  const client = await getClient(getInstanceByName(args.instance));
+  const vault = await resolveVault(client, args.vault);
+  if (!vault) throw new Error(`Vault "${args.vault}" not found.`);
+  const itemRef = await resolveItem(client, vault, args.item);
+  if (!itemRef) {
+    throw new Error(
+      `Item "${args.item}" not found in vault "${vault.title}".`,
+    );
+  }
+
+  const current = await client.items.get(vault.id, itemRef.id);
+  const updated = { ...current };
+
+  if (args.title) updated.title = args.title;
+  if (args.tags) updated.tags = args.tags;
+
+  if (Array.isArray(args.fields) && args.fields.length > 0) {
+    const existing = current.fields || [];
+    const patchesByTitle = new Map(
+      args.fields.map((p) => [p.title.toLowerCase(), p]),
+    );
+
+    // Patch existing fields in place, preserving id/type/sectionId
+    const patchedExisting = existing.map((f) => {
+      const patch = patchesByTitle.get((f.title || "").toLowerCase());
+      if (!patch) return f;
+      patchesByTitle.delete((f.title || "").toLowerCase());
+      return { ...f, value: patch.value };
+    });
+
+    // Remaining patches = new fields to add (must specify type)
+    const additions = [];
+    for (const patch of patchesByTitle.values()) {
+      if (!patch.type) {
+        throw new Error(
+          `Field "${patch.title}" doesn't exist on the item — pass a 'type' to add it as a new field.`,
+        );
+      }
+      const ft = sdk.ItemFieldType[patch.type];
+      if (!ft) throw new Error(`Unknown field type "${patch.type}".`);
+      additions.push({
+        id: patch.title.toLowerCase().replace(/\s+/g, "_"),
+        title: patch.title,
+        fieldType: ft,
+        value: patch.value,
+        sectionId: patch.sectionId,
+      });
+    }
+    updated.fields = [...patchedExisting, ...additions];
+  }
+
+  const result = await client.items.put(updated);
+  return `Updated item "${result.title}" (id: ${result.id}) in vault "${vault.title}".`;
+}
+
+async function updateVaultHandler(args) {
+  const client = await getClient(getInstanceByName(args.instance));
+  const vault = await resolveVault(client, args.vault);
+  if (!vault) throw new Error(`Vault "${args.vault}" not found.`);
+  if (!args.title && args.description === undefined) {
+    throw new Error("Provide at least one of title or description.");
+  }
+  await client.vaults.update(vault.id, {
+    title: args.title || vault.title,
+    description: args.description !== undefined ? args.description : vault.description || "",
+  });
+  return `Updated vault "${args.title || vault.title}" (id: ${vault.id}).`;
 }
 
 async function createItemHandler(args) {
@@ -909,8 +1094,10 @@ const HANDLERS = {
   op_get_secret: getSecretHandler,
   op_generate_password: generatePasswordHandler,
   op_create_item: createItemHandler,
+  op_update_item: updateItemHandler,
   op_delete_item: deleteItemHandler,
   op_create_vault: createVaultHandler,
+  op_update_vault: updateVaultHandler,
   op_delete_vault: deleteVaultHandler,
 };
 
@@ -996,6 +1183,7 @@ if (typeof module !== "undefined") {
     resolveItem,
     redactField,
     formatItem,
+    searchItems,
     // handler map + tool list (for drift guard tests)
     TOOL_DEFINITIONS,
     HANDLERS,
@@ -1006,5 +1194,7 @@ if (typeof module !== "undefined") {
     searchItemsHandler,
     getItemHandler,
     generatePasswordHandler,
+    updateItemHandler,
+    updateVaultHandler,
   };
 }
