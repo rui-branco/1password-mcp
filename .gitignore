@@ -1,0 +1,4 @@
+node_modules/
+.installed-sha
+.DS_Store
+*.log
