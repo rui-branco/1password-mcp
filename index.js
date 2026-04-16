@@ -175,6 +175,17 @@ function invalidateClient(name) {
   clientCache.delete(name);
 }
 
+/**
+ * Detect errors that indicate the IPC / desktop-app session is dead so the
+ * cached SDK client can be discarded and a fresh one created on retry.
+ */
+function isSessionError(e) {
+  if (e instanceof sdk.DesktopSessionExpiredError) return true;
+  // Belt-and-suspenders: catch IPC / auth wording from the native layer even
+  // when the SDK wraps it in a generic Error.
+  return /IPC|session.expired|desktop.auth|socket.closed/i.test(e.message);
+}
+
 // ============================================================================
 // Helpers — vault/item resolution, redaction, formatting
 // ============================================================================
@@ -1217,14 +1228,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
-  try {
-    const result = await handler(args || {});
-    return { content: [{ type: "text", text: String(result) }] };
-  } catch (e) {
-    return {
-      content: [{ type: "text", text: `Error: ${e.message}` }],
-      isError: true,
-    };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await handler(args || {});
+      return { content: [{ type: "text", text: String(result) }] };
+    } catch (e) {
+      if (attempt === 0 && isSessionError(e)) {
+        // Stale IPC connection — purge cached clients and retry once so the
+        // next getClient() call creates a fresh session.
+        clientCache.clear();
+        continue;
+      }
+      return {
+        content: [{ type: "text", text: `Error: ${e.message}` }],
+        isError: true,
+      };
+    }
   }
 });
 
