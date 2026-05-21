@@ -1,7 +1,7 @@
 {
   "name": "@rui.branco/1password-mcp",
   "version": "0.1.6",
-  "description": "1Password MCP server for Claude Code - list vaults and items, get secrets, generate passwords, manage items via service accounts. Multi-instance like jira-mcp.",
+  "description": "1Password MCP server for any MCP-compatible AI client (Claude Code, Codex, Antigravity, Cursor, etc.) - list vaults and items, get secrets, generate passwords, manage items via service accounts. Multi-instance like jira-mcp.",
   "main": "index.js",
   "bin": {
     "1password-mcp": "./index.js"

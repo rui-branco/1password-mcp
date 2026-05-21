@@ -2,7 +2,7 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for [1Password](https://1password.com/) that runs **entirely locally** — no external services, no telemetry, no leaks. Uses the official [`@1password/sdk`](https://www.npmjs.com/package/@1password/sdk) with a 1Password Service Account token.
 
-Built to mirror the multi-instance pattern of [jira-mcp](https://github.com/rui-branco/jira-mcp) so you can point the same Claude Code session at multiple 1Password accounts (e.g. `work` and `personal`).
+Works with any MCP-compatible AI client — Claude Code, Codex CLI, Google's Antigravity (Gemini), Cursor, Windsurf, Zed, and others. Built to mirror the multi-instance pattern of [jira-mcp](https://github.com/rui-branco/jira-mcp) so you can point the same session at multiple 1Password accounts (e.g. `work` and `personal`).
 
 ## Features
 
@@ -16,15 +16,40 @@ Built to mirror the multi-instance pattern of [jira-mcp](https://github.com/rui-
 ### Prerequisites
 
 - Node.js 18+
+- An MCP-compatible AI client (see [Step 1](#step-1-register-with-your-mcp-client) below)
 - Either:
   - **The 1Password 8 desktop app** (recommended — no admin permissions needed, and you get access to all vaults you can already see), or
   - A 1Password **service account** token (needs admin to provision, scoped to shared vaults only — good for CI/headless use)
 
-### Step 1: Install and register the MCP
+### Step 1: Register with your MCP client
+
+Pick the snippet for your client. All of them launch the server over stdio.
+
+**Claude Code:**
 
 ```bash
 claude mcp add --scope user --transport stdio 1password -- npx -y @rui.branco/1password-mcp
 ```
+
+**Codex CLI:** add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.1password]
+command = "npx"
+args = ["-y", "@rui.branco/1password-mcp"]
+```
+
+**Google Antigravity / Gemini CLI:** add to `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "1password": { "command": "npx", "args": ["-y", "@rui.branco/1password-mcp"] }
+  }
+}
+```
+
+**Cursor, Windsurf, Zed, Cline, Continue, etc.:** add the same `command`/`args` pair to whatever JSON config that client uses for MCP servers (the exact path varies, but the shape is standard across clients).
 
 ### Step 2: Run setup
 
@@ -53,7 +78,7 @@ When the wizard asks for "Account name", open the 1Password 8 desktop app and cl
 
 ### Step 4: Reconnect
 
-Run `/mcp` in Claude Code to reconnect the 1password server and pick up the new config.
+Restart your AI client and check its MCP status (e.g. `/mcp` in Claude Code, `mcp` in Codex CLI, or the equivalent panel in your client) to reconnect the 1password server and pick up the new config.
 
 ## Tools
 
