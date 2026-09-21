@@ -49,9 +49,12 @@ require.cache[sdkStdioPath] = {
 };
 
 // Point HOME at a throwaway dir so the config load at module time never
-// touches the user's real ~/.config/1password-mcp/config.json.
+// touches the user's real ~/.config/1password-mcp/config.json. USERPROFILE
+// has to move too: index.js resolves the config dir with os.homedir(), which
+// reads USERPROFILE on Windows and ignores HOME entirely.
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "op-mcp-test-"));
 process.env.HOME = tmpHome;
+process.env.USERPROFILE = tmpHome;
 
 const {
   loadConfigFile,

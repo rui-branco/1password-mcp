@@ -2,9 +2,10 @@
 
 const readline = require("readline");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
-const configDir = path.join(process.env.HOME, ".config/1password-mcp");
+const configDir = path.join(os.homedir(), ".config", "1password-mcp");
 const configPath = path.join(configDir, "config.json");
 
 let args = process.argv.slice(2);
@@ -199,7 +200,9 @@ async function setup() {
   saveConfig(config);
   console.log(`\nConfig saved to ${configPath} (mode 0600)`);
   console.log("\nAdd to Claude Code with:");
-  console.log("  claude mcp add --transport stdio 1password -- node $HOME/WebstormProjects/1password-mcp/index.js");
+  console.log(
+    `  claude mcp add --transport stdio 1password -- node ${path.join(__dirname, "index.js")}`,
+  );
   rl.close();
 }
 

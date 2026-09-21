@@ -26,50 +26,55 @@ const {
   ListToolsRequestSchema,
 } = require("@modelcontextprotocol/sdk/types.js");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const sdk = require("@1password/sdk");
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
 const INTEGRATION_NAME = "1password-mcp";
 
 // ============================================================================
-// Auto-update — same pattern as jira-mcp: check GitHub for a newer commit on
-// every start, install in a detached background process if found.
+// Auto-update — same pattern as jira-mcp: ask the npm registry on every start
+// what the latest published version is, and install it in the background when
+// it isn't the one we're running. The package ships through npm, so there's no
+// git involved: a plain fetch plus an npm install. Runs detached from startup
+// so the server begins serving stdio immediately.
 // ============================================================================
-const GITHUB_REPO = "rui-branco/1password-mcp";
-const INSTALLED_SHA_FILE = path.join(__dirname, ".installed-sha");
-try {
-  const localSha = fs.existsSync(INSTALLED_SHA_FILE)
-    ? fs.readFileSync(INSTALLED_SHA_FILE, "utf-8").trim()
-    : "";
-  const remoteSha = execSync(
-    `git ls-remote https://github.com/${GITHUB_REPO}.git HEAD`,
-    { stdio: "pipe", timeout: 5000 },
-  )
-    .toString()
-    .split("\t")[0]
-    .trim();
-  if (remoteSha && remoteSha !== localSha) {
-    const child = spawn(
-      "sh",
-      [
-        "-c",
-        `npm install -g git+ssh://git@github.com/${GITHUB_REPO}.git && echo "${remoteSha}" > "${INSTALLED_SHA_FILE}"`,
-      ],
-      { stdio: "ignore", detached: true },
+const NPM_PACKAGE = "@rui.branco/1password-mcp";
+(async () => {
+  try {
+    const res = await fetch(
+      `https://registry.npmjs.org/${encodeURIComponent(NPM_PACKAGE)}/latest`,
+      { signal: AbortSignal.timeout(5000) },
     );
-    child.unref();
+    const latest = (await res.json()).version;
+    if (latest && latest !== PKG_VERSION) {
+      // Passed as one shell string rather than an argv array: npm is npm.cmd on
+      // Windows, and since Node 18.20.2 spawning a .cmd without a shell throws
+      // EINVAL outright (CVE-2024-27980 hardening). shell:true picks cmd.exe
+      // there and /bin/sh elsewhere, so this stays portable — unlike the old
+      // hardcoded `sh`, which simply doesn't exist on Windows. The command is a
+      // fixed literal with no interpolation, so there's nothing to inject.
+      const child = spawn(`npm install -g ${NPM_PACKAGE}`, {
+        shell: true,
+        stdio: "ignore",
+      });
+      // A spawn failure (npm missing from PATH) arrives as an async 'error'
+      // event, which no try/catch around the spawn can see — left unhandled it
+      // would take the whole server down at startup. Swallow it here.
+      child.on("error", () => {});
+    }
+  } catch {
+    /* offline, slow registry, or bad response — no-op */
   }
-} catch {
-  /* offline or git not available — no-op */
-}
+})();
 
 // ============================================================================
 // Config
 // ============================================================================
 
-const CONFIG_DIR = path.join(process.env.HOME, ".config/1password-mcp");
+const CONFIG_DIR = path.join(os.homedir(), ".config", "1password-mcp");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 
 function ensureConfigDir() {
