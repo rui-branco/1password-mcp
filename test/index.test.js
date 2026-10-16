@@ -9,6 +9,7 @@ const path = require("path");
 // from reading the real user config.
 // ---------------------------------------------------------------------------
 
+let serverInfo;
 const mockServer = {
   setRequestHandler: () => {},
   connect: () => Promise.resolve(),
@@ -22,7 +23,8 @@ require.cache[sdkIndexPath] = {
   loaded: true,
   exports: {
     Server: class {
-      constructor() {
+      constructor(info) {
+        serverInfo = info;
         return mockServer;
       }
     },
@@ -513,5 +515,31 @@ describe("generatePasswordHandler", () => {
   it("defaults to Random when type is omitted", () => {
     const out = generatePasswordHandler({});
     assert.match(out, /^Generated \(Random\):/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// serverInfo icons
+// ---------------------------------------------------------------------------
+
+describe("serverInfo icons", () => {
+  it("sends the logo as a light and a dark base64 SVG data URI", () => {
+    assert.equal(serverInfo.icons.length, 2);
+    const source = fs.readFileSync(path.join(__dirname, "..", "assets", "icon.svg"), "utf8").trim();
+    for (const [icon, theme, fill] of [
+      [serverInfo.icons[0], "light", "#000000"],
+      [serverInfo.icons[1], "dark", "#FFFFFF"],
+    ]) {
+      assert.equal(icon.mimeType, "image/svg+xml");
+      assert.deepEqual(icon.sizes, ["any"]);
+      assert.equal(icon.theme, theme);
+      const base64 = icon.src.match(/^data:image\/svg\+xml;base64,([A-Za-z0-9+/]+={0,2})$/)?.[1];
+      assert.ok(base64, `${theme} icon is not a base64 SVG data URI`);
+      const svg = Buffer.from(base64, "base64").toString("utf8");
+      assert.equal(Buffer.from(svg).toString("base64"), base64);
+      assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" viewBox="0 0 24 24" fill="#[0-9A-F]{6}">.*<\/svg>$/);
+      assert.equal(svg, source.replace('fill="#000000"', `fill="${fill}"`));
+      assert.ok(svg.length < 4096);
+    }
   });
 });
