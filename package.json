@@ -8,7 +8,9 @@
   },
   "files": [
     "index.js",
-    "setup.js"
+    "setup.js",
+    "icons.js",
+    "assets/icon.svg"
   ],
   "scripts": {
     "setup": "node setup.js",

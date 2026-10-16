@@ -29,6 +29,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const sdk = require("@1password/sdk");
+const { ICONS } = require("./icons.js");
 const { spawn } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
@@ -1216,7 +1217,7 @@ const HANDLERS = {
 // ============================================================================
 
 const server = new Server(
-  { name: INTEGRATION_NAME, version: PKG_VERSION },
+  { name: INTEGRATION_NAME, version: PKG_VERSION, icons: ICONS },
   { capabilities: { tools: {} } },
 );
 
