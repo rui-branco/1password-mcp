@@ -1,22 +1,18 @@
-// serverInfo.icons for the MCP handshake: the logo in 1Password's own blue,
-// sent twice in the same colour, for light backgrounds and for dark ones.
-// assets/icon.svg is the 1Password logo from Simple Icons v13.21.0
-// (https://simpleicons.org), CC0-1.0.
+// serverInfo.icons for the MCP handshake: the 1Password app's own icon
+// (silver and blue rings, dark keyhole), sent once as a 48px PNG with no
+// theme. assets/icon.png comes from the 1Password Windows app package
+// (Square44x44Logo, targetsize-48, unplated).
 const fs = require("fs");
 const path = require("path");
 
-const SVG = fs.readFileSync(path.join(__dirname, "assets", "icon.svg"), "utf8").trim();
+const PNG = fs.readFileSync(path.join(__dirname, "assets", "icon.png"));
 
-function icon(fill, theme) {
-  const svg = SVG.replace('fill="#000000"', `fill="${fill}"`);
-  return {
-    src: `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`,
-    mimeType: "image/svg+xml",
-    sizes: ["any"],
-    theme,
-  };
-}
-
-const ICONS = [icon("#3B66BC", "light"), icon("#3B66BC", "dark")];
+const ICONS = [
+  {
+    src: `data:image/png;base64,${PNG.toString("base64")}`,
+    mimeType: "image/png",
+    sizes: ["48x48"],
+  },
+];
 
 module.exports = { ICONS };

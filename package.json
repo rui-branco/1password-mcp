@@ -10,7 +10,7 @@
     "index.js",
     "setup.js",
     "icons.js",
-    "assets/icon.svg"
+    "assets/icon.png"
   ],
   "scripts": {
     "setup": "node setup.js",
