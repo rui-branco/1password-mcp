@@ -523,23 +523,17 @@ describe("generatePasswordHandler", () => {
 // ---------------------------------------------------------------------------
 
 describe("serverInfo icons", () => {
-  it("sends the logo as a light and a dark base64 SVG data URI", () => {
-    assert.equal(serverInfo.icons.length, 2);
-    const source = fs.readFileSync(path.join(__dirname, "..", "assets", "icon.svg"), "utf8").trim();
-    for (const [icon, theme, fill] of [
-      [serverInfo.icons[0], "light", "#3B66BC"],
-      [serverInfo.icons[1], "dark", "#3B66BC"],
-    ]) {
-      assert.equal(icon.mimeType, "image/svg+xml");
-      assert.deepEqual(icon.sizes, ["any"]);
-      assert.equal(icon.theme, theme);
-      const base64 = icon.src.match(/^data:image\/svg\+xml;base64,([A-Za-z0-9+/]+={0,2})$/)?.[1];
-      assert.ok(base64, `${theme} icon is not a base64 SVG data URI`);
-      const svg = Buffer.from(base64, "base64").toString("utf8");
-      assert.equal(Buffer.from(svg).toString("base64"), base64);
-      assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" viewBox="0 0 24 24" fill="#[0-9A-F]{6}">.*<\/svg>$/);
-      assert.equal(svg, source.replace('fill="#000000"', `fill="${fill}"`));
-      assert.ok(svg.length < 4096);
-    }
+  it("sends the app icon once as a 48px base64 PNG data URI with no theme", () => {
+    assert.equal(serverInfo.icons.length, 1);
+    const [icon] = serverInfo.icons;
+    const source = fs.readFileSync(path.join(__dirname, "..", "assets", "icon.png"));
+    assert.equal(icon.mimeType, "image/png");
+    assert.deepEqual(icon.sizes, ["48x48"]);
+    assert.equal("theme" in icon, false);
+    assert.equal(icon.src, `data:image/png;base64,${source.toString("base64")}`);
+    const base64 = icon.src.match(/^data:image\/png;base64,([A-Za-z0-9+/]+={0,2})$/)?.[1];
+    assert.ok(base64, "icon is not a base64 PNG data URI");
+    const png = Buffer.from(base64, "base64");
+    assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   });
 });
