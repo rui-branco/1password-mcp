@@ -1,5 +1,5 @@
-// serverInfo.icons for the MCP handshake: one single-colour silhouette sent
-// twice, black for light backgrounds and white for dark ones.
+// serverInfo.icons for the MCP handshake: the logo in 1Password's own blue,
+// sent twice in the same colour, for light backgrounds and for dark ones.
 // assets/icon.svg is the 1Password logo from Simple Icons v13.21.0
 // (https://simpleicons.org), CC0-1.0.
 const fs = require("fs");
@@ -17,6 +17,6 @@ function icon(fill, theme) {
   };
 }
 
-const ICONS = [icon("#000000", "light"), icon("#FFFFFF", "dark")];
+const ICONS = [icon("#3B66BC", "light"), icon("#3B66BC", "dark")];
 
 module.exports = { ICONS };
