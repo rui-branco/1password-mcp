@@ -188,8 +188,9 @@ function invalidateClient(name) {
 function isSessionError(e) {
   if (e instanceof sdk.DesktopSessionExpiredError) return true;
   // Belt-and-suspenders: catch IPC / auth wording from the native layer even
-  // when the SDK wraps it in a generic Error.
-  return /IPC|session.expired|desktop.auth|socket.closed/i.test(e.message);
+  // when the SDK wraps it in a generic Error. "invalid client id" is what the
+  // desktop app answers once it has dropped a client, e.g. after a lock.
+  return /IPC|session.expired|desktop.auth|socket.closed|invalid.client.id/i.test(e.message);
 }
 
 // ============================================================================
@@ -1280,6 +1281,7 @@ if (typeof module !== "undefined") {
     // instance resolution
     getInstanceByName,
     // helpers
+    isSessionError,
     collect,
     resolveVault,
     resolveItem,

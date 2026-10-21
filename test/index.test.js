@@ -72,6 +72,7 @@ const {
   generatePasswordHandler,
   searchItemsHandler,
   searchItems,
+  isSessionError,
 } = require("../index.js");
 
 // ---------------------------------------------------------------------------
@@ -535,5 +536,16 @@ describe("serverInfo icons", () => {
     assert.ok(base64, "icon is not a base64 PNG data URI");
     const png = Buffer.from(base64, "base64");
     assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  });
+});
+
+describe("isSessionError", () => {
+  it("treats a client the desktop app dropped as a dead session, so it is recreated", () => {
+    assert.equal(isSessionError(new Error("invalid client id")), true);
+    assert.equal(isSessionError(new Error("IPC connection closed")), true);
+  });
+
+  it("leaves ordinary errors alone", () => {
+    assert.equal(isSessionError(new Error("item not found")), false);
   });
 });
