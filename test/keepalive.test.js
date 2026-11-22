@@ -147,6 +147,36 @@ describe("when the locked app answers a plain \"invalid client id\"", () => {
   });
 });
 
+describe("calls that start at the same instant", () => {
+  // The stand-in app, like the real one, refuses a third request while it
+  // holds two. Chats send several calls at once, and all chats share it.
+
+  it("all go through, from two chats at once", async () => {
+    const home = box();
+    const one = await server(home);
+    const two = await server(home);
+    await one.call("op_list_vaults");
+    const answers = await Promise.all([
+      ...Array.from({ length: 6 }, () => one.call("op_list_vaults")),
+      ...Array.from({ length: 4 }, () => two.call("op_search_items", { query: "x" })),
+      two.call("op_list_items", { vault: "Shared" }),
+    ]);
+    for (const answer of answers) assert.equal(answer.isError, false, answer.text);
+    assert.equal(home.prompts().length, 1);
+    assert.ok(!home.brokerLog().includes("not approved"), home.brokerLog());
+  });
+
+  it("all go through when they are the very first calls", async () => {
+    const home = box();
+    const chat = await server(home);
+    const answers = await Promise.all(
+      Array.from({ length: 5 }, () => chat.call("op_list_vaults")),
+    );
+    for (const answer of answers) assert.equal(answer.isError, false, answer.text);
+    assert.equal(home.prompts().length, 1);
+  });
+});
+
 describe("with keepAuthorized turned off", () => {
   const home = box({ keepAuthorized: false });
 

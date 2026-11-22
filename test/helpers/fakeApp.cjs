@@ -12,6 +12,8 @@
 //     answered with the SDK's session-expired error or, as the real app does
 //     once it has dropped a client, a plain "invalid client id"
 //     (OP_MCP_TEST_LOCK_ANSWER=invalid-client-id)
+//   - it answers one request at a time, keeps one more waiting and refuses a
+//     third with "IPC operation failed: -2"
 // The lock state is the file in OP_MCP_TEST_APP_STATE, which a test flips.
 
 const fs = require("fs");
@@ -68,7 +70,33 @@ const VAULTS = [
 const sessions = new Set(); // client ids this PROCESS holds an approved session for
 let nextId = 1;
 
-SharedLibCore.prototype.callSharedLibrary = async function (input, kind) {
+// The real app answers one request at a time and keeps one more waiting. A
+// third that arrives meanwhile is refused at once (measured against it: of 6
+// calls started together, 4 came back "IPC operation failed: -2" in 10 ms).
+let inApp = 0;
+let appTurn = Promise.resolve();
+
+async function throughApp(work) {
+  if (inApp >= 2) throw new Error("IPC operation failed: -2");
+  inApp++;
+  const mine = appTurn.then(async () => {
+    await new Promise((r) => setTimeout(r, 15));
+    return work();
+  });
+  appTurn = mine.catch(() => {});
+  try {
+    return await mine;
+  } finally {
+    inApp--;
+  }
+}
+
+SharedLibCore.prototype.callSharedLibrary = function (input, kind) {
+  if (kind !== "init_client" && kind !== "invoke") return Promise.resolve(""); // release_client
+  return throughApp(() => answer.call(this, input, kind));
+};
+
+async function answer(input, kind) {
   const account = this.acccountName;
   if (kind === "init_client") {
     if (locked() || sessions.size === 0) {
@@ -91,5 +119,5 @@ SharedLibCore.prototype.callSharedLibrary = async function (input, kind) {
     if (parameters.name === "VaultsList") return JSON.stringify(VAULTS);
     return "[]";
   }
-  return ""; // release_client
-};
+  return "";
+}

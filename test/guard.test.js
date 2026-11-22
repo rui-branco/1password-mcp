@@ -135,3 +135,113 @@ describe("guardDesktopApp", () => {
     assert.deepEqual(second, [ACCOUNT]);
   });
 });
+
+// The real app answers one request at a time, keeps one more waiting and
+// refuses a third with "IPC operation failed: -2".
+describe("requests reach the desktop app in turn", () => {
+  const BUSY = "IPC operation failed: -2";
+
+  /** An app that counts how many requests are inside it at once. */
+  function countingApp() {
+    const seen = { inside: 0, most: 0 };
+    const app = async () => {
+      seen.inside++;
+      seen.most = Math.max(seen.most, seen.inside);
+      await new Promise((r) => setTimeout(r, 10));
+      seen.inside--;
+      return "[]";
+    };
+    return { app, seen };
+  }
+
+  it("hands over one request at a time, however many start together", async () => {
+    guardDesktopApp({});
+    const { app, seen } = countingApp();
+    const { inner } = client(app);
+    const answers = await Promise.all(
+      Array.from({ length: 8 }, () => inner.invoke(LIST_VAULTS())),
+    );
+    assert.deepEqual(answers, Array(8).fill("[]"));
+    assert.equal(seen.most, 1);
+  });
+
+  it("keeps one line for every client in the process", async () => {
+    guardDesktopApp({});
+    const { app, seen } = countingApp();
+    const a = client(app);
+    const b = client(app);
+    await Promise.all([
+      a.inner.invoke(LIST_VAULTS()),
+      b.inner.invoke(LIST_VAULTS()),
+      a.inner.invoke(LIST_VAULTS()),
+      b.inner.invoke(LIST_VAULTS()),
+    ]);
+    assert.equal(seen.most, 1);
+  });
+
+  it("goes on with the next request after one fails", async () => {
+    guardDesktopApp({});
+    let n = 0;
+    const { inner } = client(async () => {
+      if (++n === 1) throw new Error("item not found");
+      return "[]";
+    });
+    const [first, second] = await Promise.allSettled([
+      inner.invoke(LIST_VAULTS()),
+      inner.invoke(LIST_VAULTS()),
+    ]);
+    assert.equal(first.status, "rejected");
+    assert.equal(second.value, "[]");
+  });
+
+  it("tries again when another program has the app busy", async () => {
+    guardDesktopApp({});
+    let n = 0;
+    const { inner, calls } = client(async () => {
+      if (++n <= 2) throw new Error(BUSY);
+      return "[]";
+    });
+    assert.equal(await inner.invoke(LIST_VAULTS()), "[]");
+    assert.deepEqual(calls, ["invoke", "invoke", "invoke"]);
+  });
+
+  it("tries a refused approval request again too, without reporting a refusal", async () => {
+    const refused = [];
+    const approved = [];
+    guardDesktopApp({
+      refused: (account) => refused.push(account),
+      authorized: (account) => approved.push(account),
+    });
+    let n = 0;
+    const { inner, calls } = client(async (kind) => {
+      if (kind === "init_client") {
+        if (++n === 1) throw new Error(BUSY);
+        return "2";
+      }
+      if (n === 0) throw new sdk.DesktopSessionExpiredError("session expired");
+      return "[]";
+    });
+    assert.equal(await inner.invoke(LIST_VAULTS()), "[]");
+    assert.deepEqual(calls, ["invoke", "init_client", "init_client", "invoke"]);
+    assert.deepEqual(refused, []);
+    assert.deepEqual(approved, [ACCOUNT]);
+  });
+
+  it("gives up on an app that stays busy, with the app's own error", async () => {
+    guardDesktopApp({});
+    const { inner, calls } = client(async () => {
+      throw new Error(BUSY);
+    });
+    await assert.rejects(inner.invoke(LIST_VAULTS()), /IPC operation failed: -2/);
+    assert.equal(calls.length, 6);
+  });
+
+  it("does not try an ordinary error again", async () => {
+    guardDesktopApp({});
+    const { inner, calls } = client(async () => {
+      throw new Error("item not found");
+    });
+    await assert.rejects(inner.invoke(LIST_VAULTS()), /item not found/);
+    assert.deepEqual(calls, ["invoke"]);
+  });
+});
