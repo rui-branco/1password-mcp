@@ -58,6 +58,13 @@ const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "op-mcp-test-"));
 process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 
+// index.js looks for a newer version on npm when it loads and installs it.
+// While package.json holds a version that is not published yet, that would
+// put the published package back over the servers running on this machine.
+globalThis.fetch = async () => {
+  throw new Error("offline in tests");
+};
+
 const {
   loadConfigFile,
   saveConfigFile,
