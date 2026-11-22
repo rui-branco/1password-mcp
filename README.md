@@ -80,6 +80,34 @@ When the wizard asks for "Account name", open the 1Password 8 desktop app and cl
 
 Restart your AI client and check its MCP status (e.g. `/mcp` in Claude Code, `mcp` in Codex CLI, or the equivalent panel in your client) to reconnect the 1password server and pick up the new config.
 
+## One approval for all chats (desktop auth)
+
+The 1Password app approves each *process* that talks to it, and an approval ends after ten quiet minutes. An MCP client starts one server per chat or per project folder, so left alone every one of them makes the app ask again. On Windows that is the Windows Hello or password prompt each time.
+
+So the servers share one small background process:
+
+- The first call that needs the desktop app starts it. Every server process on the machine, and the `read` command below, sends its desktop-auth calls through it. The app sees one caller and asks once.
+- While 1Password stays unlocked, that process keeps the approval alive, so a call after a quiet spell is not asked about again. It stops doing so twelve hours after the approval, or once no server has been running and no call has come in for an hour; the approval then runs out by 1Password's own ten minute rule.
+- When 1Password locks, the approval is gone and the background process exits. The next call asks you to unlock, once. Keeping the approval alive never makes the app ask you by itself.
+- Service-account instances are not involved. They never prompt.
+
+Two options in `config.json`, both `true` unless set:
+
+| Option | When `false` |
+|---|---|
+| `sharedApproval` | Every server process talks to the app itself and is approved separately. |
+| `keepAuthorized` | Still one shared approval, but it is not kept alive: after ten minutes without a call the app asks again. |
+
+`~/.config/1password-mcp/broker.log` shows when the background process started, which server asked for which tool (its pid and folder, never arguments or values) and how long each approval took, which tells a prompt from a silent one.
+
+### Secrets in shell commands
+
+```bash
+TOKEN=$(npx -y @rui.branco/1password-mcp read "op://Private/GitHub/token")
+```
+
+`read` prints one value to stdout (`-n` drops the newline, `--instance <name>` picks an instance) through that same approval. Use it where a script would call `op read`: on Windows the `op` CLI is approved per calling process, so every `op` call a model runs from its shell asks you again. The server's instructions tell the model to use this command and to keep away from the `op` CLI.
+
 ## Tools
 
 | Tool | Description |
@@ -105,15 +133,19 @@ All tools that talk to 1Password accept an optional `instance` parameter. Omit i
 - Tokens live only in `~/.config/1password-mcp/config.json` (chmod 0600) and in the SDK client process. They are never logged or transmitted anywhere except to `*.1password.com`.
 - Service accounts only see vaults that have been explicitly shared with them — personal vaults are inaccessible by design.
 - Concealed fields are redacted by default in tool output so the model cannot accidentally quote a password back. Pass `includeConcealed: true` only when you actually need the cleartext.
+- With desktop auth, the shared background process only answers processes that can read `~/.config/1password-mcp/broker.key` (0600, so yours), and both sides prove they hold that key before a call is sent. Once you have approved it, any process running as you can reach 1Password through it without another prompt until 1Password locks. That is the price of not being asked per chat; set `sharedApproval: false` to go back to one approval per process.
 
 ## Config shape
 
 ```json
 {
   "instances": [
-    { "name": "work", "token": "ops_...", "description": "ITO service account" }
+    { "name": "work", "token": "ops_...", "description": "ITO service account" },
+    { "name": "me", "authType": "desktop", "accountName": "my.1password.com" }
   ],
-  "defaultInstance": "work"
+  "defaultInstance": "work",
+  "sharedApproval": true,
+  "keepAuthorized": true
 }
 ```
 
