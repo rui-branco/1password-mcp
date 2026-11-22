@@ -28,13 +28,15 @@ function note(event, extra) {
   fs.appendFileSync(LOG, `${JSON.stringify({ event, pid: process.pid, ...extra })}\n`);
 }
 
-function locked() {
+function appState() {
   try {
-    return fs.readFileSync(STATE, "utf8").trim() === "locked";
+    return fs.readFileSync(STATE, "utf8").trim();
   } catch {
-    return false;
+    return "unlocked";
   }
 }
+
+const locked = () => appState() === "locked";
 
 // A server looks for a newer version on npm when it starts and installs it.
 // A test must never do that, so the registry is unreachable in here.
@@ -98,6 +100,8 @@ SharedLibCore.prototype.callSharedLibrary = function (input, kind) {
 
 async function answer(input, kind) {
   const account = this.acccountName;
+  // A passing fault on the way to the app: sessions stay as they are.
+  if (appState() === "glitch") throw new Error("IPC connection closed");
   if (kind === "init_client") {
     if (locked() || sessions.size === 0) {
       note("prompt", { account });

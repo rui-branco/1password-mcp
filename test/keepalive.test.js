@@ -147,6 +147,40 @@ describe("when the locked app answers a plain \"invalid client id\"", () => {
   });
 });
 
+describe("after a call failed on a passing IPC error", () => {
+  // Seen against the real app: such a failure throws the cached client away,
+  // and the approval was then given up at the next refresh although the app
+  // still held it, so the following call asked the user again.
+  const home = box();
+  let chat;
+  let sharedPid;
+
+  it("reports the failure of that call", async () => {
+    chat = await server(home);
+    await chat.call("op_list_vaults");
+    [sharedPid] = home.prompts();
+    home.glitchApp(true);
+    const failed = await chat.call("op_list_vaults");
+    assert.equal(failed.isError, true);
+    assert.match(failed.text, /IPC connection closed/);
+    home.glitchApp(false);
+  });
+
+  it("still keeps the approval alive", async () => {
+    const before = home.requests();
+    await minutes(11);
+    assert.equal(alive(sharedPid), true);
+    assert.ok(home.requests() > before, "no refresh was made");
+    assert.ok(!home.brokerLog().includes("the approval ended"), home.brokerLog());
+  });
+
+  it("serves the next call without asking", async () => {
+    const answer = await chat.call("op_list_vaults");
+    assert.equal(answer.isError, false, answer.text);
+    assert.deepEqual(home.prompts(), [sharedPid]);
+  });
+});
+
 describe("calls that start at the same instant", () => {
   // The stand-in app, like the real one, refuses a third request while it
   // holds two. Chats send several calls at once, and all chats share it.

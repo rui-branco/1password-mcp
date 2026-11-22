@@ -45,6 +45,13 @@ function sandbox(config, { standIn = "sdk", env: extraEnv } = {}) {
     lockApp() {
       fs.writeFileSync(appState, "locked");
     },
+    /**
+     * Makes the stand-in app fail every request with a passing IPC error
+     * (true) or work again (false), without ending any session.
+     */
+    glitchApp(on) {
+      fs.writeFileSync(appState, on ? "glitch" : "unlocked");
+    },
     /** What the stand-in SDK recorded, in order. */
     sdkCalls() {
       return fs
