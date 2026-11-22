@@ -222,6 +222,9 @@ async function getClient(instance) {
   }
   let pending = clientCache.get(instance.name);
   if (!pending) {
+    // Wherever a desktop client lives (the shared process, or this one when
+    // that cannot be used), its requests reach the app one at a time.
+    if (instance.authType === "desktop") desktopTransport();
     pending = sdk.createClient({
       auth: buildAuth(instance),
       integrationName: INTEGRATION_NAME,
@@ -1435,7 +1438,7 @@ async function callTool(name, args) {
 }
 
 // ============================================================================
-// The shared process (`--broker`)
+// Talking to the desktop app
 // ============================================================================
 
 // Set while an approval is being refreshed. Inside it the SDK is refused a
@@ -1444,34 +1447,73 @@ async function callTool(name, args) {
 const noPrompt = new AsyncLocalStorage();
 const GUARD = Symbol.for("1password-mcp.guard");
 
+// The desktop app answers one request at a time and keeps one more waiting.
+// A third that arrives meanwhile is turned away at once with "IPC operation
+// failed: -2" (measured against the real app: of 6 calls started together, 4
+// failed within 10 ms). With every chat going through one process that would
+// be common, so requests are handed to the app one by one.
+let appLine = Promise.resolve();
+// A request that hangs gives up its turn after this, so one stuck call cannot
+// hold every later one. An approval may sit on the user's screen much longer.
+const CALL_TURN_MS = 30 * 1000;
+const PROMPT_TURN_MS = 10 * 60 * 1000;
+
+function inTurn(fn, turnMs) {
+  const run = appLine.then(fn);
+  appLine = new Promise((next) => {
+    const timer = setTimeout(next, turnMs);
+    if (timer.unref) timer.unref();
+    const done = () => {
+      clearTimeout(timer);
+      next();
+    };
+    run.then(done, done);
+  });
+  return run;
+}
+
+// Another program can be talking to the app at that moment (the `op` CLI, a
+// server of an older version), and then a request is turned away although
+// ours came one by one. It is tried again a few times, for about 1.5 s.
+const BUSY_TRIES = 5;
+
+async function unlessBusy(fn) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const busy = /IPC operation failed/i.test((e && e.message) || "");
+      if (!busy || attempt >= BUSY_TRIES) throw e;
+      await new Promise((r) => setTimeout(r, 50 * 2 ** attempt + Math.random() * 50));
+    }
+  }
+}
+
 /**
- * Hooks into the SDK's desktop-app transport. It tells `watch` when the app
- * approved an account, when a request for it went through and when the app
- * reported its session gone, and it refuses
- * a new approval inside `noPrompt`: the SDK asks again by itself whenever the
- * app reports the session gone, which is right for a call the user asked for
- * and wrong for a background refresh.
+ * Puts this server between the SDK and its desktop-app transport, once per
+ * process. From then on requests reach the app in turn (see above), and the
+ * returned state's `watch` is told when the app approved an account, when a
+ * request for it went through and when the app reported its session gone.
+ * Inside `noPrompt` a new approval is refused: the SDK asks again by itself
+ * whenever the app reports the session gone, which is right for a call the
+ * user asked for and wrong for a background refresh.
  *
  * The transport is not part of the SDK's public API. When it cannot be found
- * this returns false, and an approval is then never refreshed: it just
- * follows 1Password's own ten minute rule.
+ * this returns null and the SDK is used as it comes.
  */
-function guardDesktopApp(watch = {}) {
+function desktopTransport() {
   try {
     const file = path.join(
       path.dirname(require.resolve("@1password/sdk")),
       "shared_lib_core.js",
     );
     const proto = require(file).SharedLibCore.prototype;
-    if (proto[GUARD]) {
-      proto[GUARD].watch = watch;
-      return true;
-    }
+    if (proto[GUARD]) return proto[GUARD];
     const { initClient, invoke } = proto;
     if (typeof initClient !== "function" || typeof invoke !== "function") {
-      return false;
+      return null;
     }
-    const state = { watch };
+    const state = { watch: {} };
     // "acccountName" is the SDK's own spelling.
     const accountOf = (core) => core.acccountName || core.accountName;
     proto.initClient = async function (config) {
@@ -1480,7 +1522,10 @@ function guardDesktopApp(watch = {}) {
       }
       const started = Date.now();
       try {
-        const id = await initClient.call(this, config);
+        const id = await inTurn(
+          () => unlessBusy(() => initClient.call(this, config)),
+          PROMPT_TURN_MS,
+        );
         state.watch.authorized?.(accountOf(this), Date.now() - started);
         return id;
       } catch (e) {
@@ -1491,7 +1536,10 @@ function guardDesktopApp(watch = {}) {
     proto.invoke = async function (config) {
       let out;
       try {
-        out = await invoke.call(this, config);
+        out = await inTurn(
+          () => unlessBusy(() => invoke.call(this, config)),
+          CALL_TURN_MS,
+        );
       } catch (e) {
         // The app says so in two ways: the SDK's own error, or a plain
         // "invalid client id" once it has dropped the client (after a lock).
@@ -1507,11 +1555,27 @@ function guardDesktopApp(watch = {}) {
       return out;
     };
     proto[GUARD] = state;
-    return true;
+    return state;
   } catch {
-    return false;
+    return null;
   }
 }
+
+/**
+ * Sets who is told about approvals and requests (see desktopTransport).
+ * Returns false when the SDK's transport cannot be reached; an approval is
+ * then never refreshed and just follows 1Password's own ten minute rule.
+ */
+function guardDesktopApp(watch = {}) {
+  const state = desktopTransport();
+  if (!state) return false;
+  state.watch = watch;
+  return true;
+}
+
+// ============================================================================
+// The shared process (`--broker`)
+// ============================================================================
 
 // The tests run the shared process on a faster clock. It can only ever
 // shorten how long an approval is kept, never stretch it.
