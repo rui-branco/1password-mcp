@@ -8,6 +8,7 @@
   },
   "files": [
     "index.js",
+    "broker.js",
     "setup.js",
     "icons.js",
     "assets/icon.png"

@@ -9,6 +9,10 @@
 //
 // Multi-instance: several 1Password accounts can be configured; each tool
 // accepts an optional `instance` parameter to pick which one to hit.
+//
+// Desktop-app auth goes through one shared background process (broker.js), so
+// the app asks the user to approve once for every chat instead of once per
+// server process. See "One approval for everything" below.
 // ============================================================================
 
 // Handle `1password-mcp setup` subcommand
@@ -17,19 +21,26 @@ if (process.argv[2] === "setup") {
   return;
 }
 
-const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
-const {
-  StdioServerTransport,
-} = require("@modelcontextprotocol/sdk/server/stdio.js");
-const {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} = require("@modelcontextprotocol/sdk/types.js");
+// What this process is: the MCP server (default), the shared background
+// process (`--broker`, started by a server, never by hand), the `read`
+// command, or a module loaded by the tests.
+const RUN_AS =
+  require.main !== module
+    ? "module"
+    : process.argv[2] === "--broker"
+      ? "broker"
+      : process.argv[2] === "read"
+        ? "read"
+        : "server";
+const IS_SERVER = RUN_AS === "server" || RUN_AS === "module";
+
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { AsyncLocalStorage } = require("async_hooks");
 const sdk = require("@1password/sdk");
 const { ICONS } = require("./icons.js");
+const broker = require("./broker.js");
 const { spawn } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
@@ -44,6 +55,9 @@ const INTEGRATION_NAME = "1password-mcp";
 // ============================================================================
 const NPM_PACKAGE = "@rui.branco/1password-mcp";
 (async () => {
+  // Only the server looks for updates: the shared process and `read` run the
+  // code a server already brought up to date.
+  if (!IS_SERVER) return;
   try {
     const res = await fetch(
       `https://registry.npmjs.org/${encodeURIComponent(NPM_PACKAGE)}/latest`,
@@ -116,17 +130,61 @@ function normalizeInstance(raw) {
   };
 }
 
-const rawConfig = fs.existsSync(CONFIG_PATH)
-  ? loadConfigFile()
-  : { instances: [] };
+let instances = [];
+let defaultInstance = null;
 
-let instances = (rawConfig.instances || []).map(normalizeInstance);
+// Options beside the instance list, both on unless the config says `false`:
+//   sharedApproval  desktop-app calls go through the one shared process
+//   keepAuthorized  that process keeps the approval alive while 1Password
+//                   stays unlocked, instead of letting it end after ten
+//                   quiet minutes
+const settings = { sharedApproval: true, keepAuthorized: true };
 
-let defaultInstance =
-  (rawConfig.defaultInstance &&
-    instances.find((i) => i.name === rawConfig.defaultInstance)) ||
-  instances[0] ||
-  null;
+// Cache SDK clients per instance — createClient spins up a WASM runtime and
+// negotiates an auth session, so we want exactly one per process lifetime.
+// The PROMISE is cached, not the client: tool calls often arrive together,
+// and two of them would otherwise each create a client and each ask the
+// desktop app for approval.
+const clientCache = new Map();
+// What each cached client was built from, so a client for an instance that
+// was since removed or pointed at another account is not reused.
+const clientAuth = new Map();
+
+function authOf(instance) {
+  return `${instance.authType}|${instance.accountName || ""}|${instance.token || ""}`;
+}
+
+/**
+ * Read the config file again. The file is shared: another server process, the
+ * setup wizard or the shared process may have changed it since this process
+ * started, and a call must not run against an instance list that is out of
+ * date.
+ */
+function reloadConfig() {
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  } catch (e) {
+    // There but unreadable: another process is writing it this instant. Keep
+    // what we have rather than run the call with no instances at all.
+    if (e.code !== "ENOENT") return;
+    raw = {};
+  }
+  instances = (raw.instances || []).map(normalizeInstance);
+  defaultInstance =
+    (raw.defaultInstance &&
+      instances.find((i) => i.name === raw.defaultInstance)) ||
+    instances[0] ||
+    null;
+  settings.sharedApproval = raw.sharedApproval !== false;
+  settings.keepAuthorized = raw.keepAuthorized !== false;
+  for (const [name, built] of clientAuth) {
+    const inst = instances.find((i) => i.name === name);
+    if (!inst || authOf(inst) !== built) invalidateClient(name);
+  }
+}
+
+reloadConfig();
 
 /**
  * Resolve an instance by name, falling back to the default if the name is
@@ -140,10 +198,6 @@ function getInstanceByName(name) {
 // ============================================================================
 // 1Password SDK client
 // ============================================================================
-
-// Cache SDK clients per instance — createClient spins up a WASM runtime and
-// negotiates an auth session, so we want exactly one per process lifetime.
-const clientCache = new Map();
 
 function buildAuth(instance) {
   if (instance.authType === "desktop") {
@@ -166,19 +220,28 @@ async function getClient(instance) {
       "No 1Password instance configured. Run `1password-mcp setup` or call op_add_instance.",
     );
   }
-  if (clientCache.has(instance.name)) return clientCache.get(instance.name);
-
-  const client = await sdk.createClient({
-    auth: buildAuth(instance),
-    integrationName: INTEGRATION_NAME,
-    integrationVersion: `v${PKG_VERSION}`,
-  });
-  clientCache.set(instance.name, client);
-  return client;
+  let pending = clientCache.get(instance.name);
+  if (!pending) {
+    pending = sdk.createClient({
+      auth: buildAuth(instance),
+      integrationName: INTEGRATION_NAME,
+      integrationVersion: `v${PKG_VERSION}`,
+    });
+    clientCache.set(instance.name, pending);
+    clientAuth.set(instance.name, authOf(instance));
+    // A refused or failed approval must not stick: the next call asks again.
+    pending.catch(() => {
+      if (clientCache.get(instance.name) === pending) {
+        invalidateClient(instance.name);
+      }
+    });
+  }
+  return pending;
 }
 
 function invalidateClient(name) {
   clientCache.delete(name);
+  clientAuth.delete(name);
 }
 
 /**
@@ -1214,54 +1277,562 @@ const HANDLERS = {
 })();
 
 // ============================================================================
+// Running a call
+// ============================================================================
+
+/**
+ * Runs `fn`. If the desktop-app session turns out to be dead, the cached
+ * clients are thrown away and it runs once more, so the SDK opens a fresh
+ * session.
+ */
+async function withSessionRetry(fn) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (attempt > 0 || !isSessionError(e)) throw e;
+      clientCache.clear();
+      clientAuth.clear();
+    }
+  }
+}
+
+/** Runs a tool in THIS process and returns its text. */
+function runTool(name, args) {
+  return withSessionRetry(async () => String(await HANDLERS[name](args)));
+}
+
+/** Resolves an `op://` reference in THIS process. */
+function readSecret(instanceName, reference) {
+  return withSessionRetry(async () => {
+    const client = await getClient(getInstanceByName(instanceName));
+    return client.secrets.resolve(reference);
+  });
+}
+
+// ============================================================================
+// One approval for everything (desktop-app auth)
+//
+// The 1Password app approves each calling process separately. A call that
+// needs the desktop app is therefore not made here: it is handed to the one
+// shared background process (see broker.js) that every server process and the
+// `read` command use. The app sees a single caller and asks once.
+//
+// Service-account instances never make the app ask, so their calls stay in
+// this process. If the shared process cannot be reached, the call runs here
+// as it always did; the only cost is that the app may ask again.
+// ============================================================================
+
+const BROKER_ENDPOINT = broker.endpointFor(CONFIG_DIR, PKG_VERSION);
+
+// Tools that never talk to a 1Password account.
+const LOCAL_TOOLS = new Set([
+  "op_list_instances",
+  "op_remove_instance",
+  "op_generate_password",
+]);
+
+/** True when running the tool makes the desktop app approve the caller. */
+function usesDesktopApp(name, args) {
+  if (LOCAL_TOOLS.has(name)) return false;
+  if (name === "op_add_instance") {
+    // Adding a desktop instance checks it against the app first.
+    const authType = args.authType || (args.token ? "serviceAccount" : "desktop");
+    return authType === "desktop";
+  }
+  const inst = getInstanceByName(args.instance);
+  return !!inst && inst.authType === "desktop";
+}
+
+let brokerStarting = null;
+let presence = null;
+
+function brokerLink() {
+  return { endpoint: BROKER_ENDPOINT, key: broker.loadKey(CONFIG_DIR) };
+}
+
+/**
+ * Stay connected to the shared process for as long as this server runs. That
+ * open connection is how it knows a chat is still there: once none has been
+ * for an hour, it stops keeping the approval alive.
+ */
+function holdPresence(link) {
+  if (presence || RUN_AS === "read") return;
+  presence = broker
+    .request({ ...link, payload: { method: "presence" }, keepOpen: true })
+    .then(
+      ({ sock }) => {
+        // Must not keep this server running once its own client is gone.
+        sock.unref();
+        sock.on("close", () => {
+          presence = null;
+        });
+        return sock;
+      },
+      () => {
+        presence = null;
+      },
+    );
+}
+
+/**
+ * Hands a request to the shared process, starting it when none is running.
+ * Resolves with its reply, or with null when it cannot be used (turned off,
+ * would not start, or the pipe is held by something that is not ours) and
+ * the caller should do the work itself.
+ */
+async function viaBroker(payload) {
+  if (!settings.sharedApproval) return null;
+  let link;
+  try {
+    link = brokerLink();
+  } catch {
+    return null;
+  }
+  const from = { pid: process.pid, cwd: process.cwd() };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const { reply } = await broker.request({
+        ...link,
+        payload: { ...payload, from },
+      });
+      holdPresence(link);
+      return reply;
+    } catch (e) {
+      // It had the request and went away. Running the call again here could
+      // repeat a change (a second item, a second delete), so report instead.
+      if (e.sent) {
+        throw new Error(
+          "The shared 1Password process stopped while handling this call. Try again.",
+        );
+      }
+      if (attempt > 0 || e.code !== "EUNREACHABLE") return null;
+      if (!brokerStarting) {
+        brokerStarting = broker
+          .start({ ...link, entry: __filename })
+          .catch(() => false)
+          .finally(() => {
+            brokerStarting = null;
+          });
+      }
+      if (!(await brokerStarting)) return null;
+    }
+  }
+  return null;
+}
+
+/** Runs a tool call wherever it belongs and returns its text. */
+async function callTool(name, args) {
+  reloadConfig();
+  if (usesDesktopApp(name, args)) {
+    const reply = await viaBroker({ method: "tool", name, args });
+    if (reply) {
+      if (!reply.ok) throw new Error(reply.error);
+      return reply.text;
+    }
+  }
+  return runTool(name, args);
+}
+
+// ============================================================================
+// The shared process (`--broker`)
+// ============================================================================
+
+// Set while an approval is being refreshed. Inside it the SDK is refused a
+// new approval, so a refresh can find out that the approval ended but can
+// never be the reason the app asks the user.
+const noPrompt = new AsyncLocalStorage();
+const GUARD = Symbol.for("1password-mcp.guard");
+
+/**
+ * Hooks into the SDK's desktop-app transport. It tells `watch` when the app
+ * approved an account, when a request for it went through and when the app
+ * reported its session gone, and it refuses
+ * a new approval inside `noPrompt`: the SDK asks again by itself whenever the
+ * app reports the session gone, which is right for a call the user asked for
+ * and wrong for a background refresh.
+ *
+ * The transport is not part of the SDK's public API. When it cannot be found
+ * this returns false, and an approval is then never refreshed: it just
+ * follows 1Password's own ten minute rule.
+ */
+function guardDesktopApp(watch = {}) {
+  try {
+    const file = path.join(
+      path.dirname(require.resolve("@1password/sdk")),
+      "shared_lib_core.js",
+    );
+    const proto = require(file).SharedLibCore.prototype;
+    if (proto[GUARD]) {
+      proto[GUARD].watch = watch;
+      return true;
+    }
+    const { initClient, invoke } = proto;
+    if (typeof initClient !== "function" || typeof invoke !== "function") {
+      return false;
+    }
+    const state = { watch };
+    // "acccountName" is the SDK's own spelling.
+    const accountOf = (core) => core.acccountName || core.accountName;
+    proto.initClient = async function (config) {
+      if (noPrompt.getStore()) {
+        throw new sdk.DesktopSessionExpiredError("the approval ended");
+      }
+      const started = Date.now();
+      try {
+        const id = await initClient.call(this, config);
+        state.watch.authorized?.(accountOf(this), Date.now() - started);
+        return id;
+      } catch (e) {
+        state.watch.refused?.(accountOf(this), Date.now() - started, e);
+        throw e;
+      }
+    };
+    proto.invoke = async function (config) {
+      let out;
+      try {
+        out = await invoke.call(this, config);
+      } catch (e) {
+        // The app says so in two ways: the SDK's own error, or a plain
+        // "invalid client id" once it has dropped the client (after a lock).
+        if (
+          e instanceof sdk.DesktopSessionExpiredError ||
+          /invalid.client.id/i.test((e && e.message) || "")
+        ) {
+          state.watch.expired?.(accountOf(this));
+        }
+        throw e;
+      }
+      state.watch.used?.(accountOf(this));
+      return out;
+    };
+    proto[GUARD] = state;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The tests run the shared process on a faster clock. It can only ever
+// shorten how long an approval is kept, never stretch it.
+const SPEED = Math.max(1, Number(process.env.OP_MCP_TEST_SPEED) || 1);
+const TICK_MS = (30 * 1000) / SPEED;
+// A shared process holding no approval leaves this long after its last call.
+const LINGER_MS = (60 * 1000) / SPEED;
+
+async function brokerMain() {
+  process.title = "1password-mcp-broker";
+  const log = broker.logger(path.join(CONFIG_DIR, "broker.log"));
+  const asker = new AsyncLocalStorage(); // the call that is running, for the log
+  const chats = new Set(); // one open connection per running server
+  const seen = new Set(); // accounts whose approval went through the guard
+  let inFlight = 0;
+  let lastCallAt = Date.now();
+  let stopping = false;
+  let guarded = false;
+  let listener = null;
+
+  const leave = (why) => {
+    log(`exit: ${why}`);
+    try {
+      listener?.close();
+    } catch {
+      /* going away anyway */
+    }
+    process.exit(0);
+  };
+  process.on("uncaughtException", (e) => {
+    log(`crashed: ${(e && e.stack) || e}`);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (e) => {
+    log(`unhandled: ${(e && e.message) || e}`);
+  });
+
+  const keeper = broker.createKeeper({
+    speed: SPEED,
+    // Only where the guard is known to sit on the path the SDK really takes.
+    canPing: (account) => guarded && seen.has(account),
+    inUse: () => chats.size > 0,
+    keepAuthorized: () => settings.keepAuthorized,
+    ping: async (account) => {
+      const inst = instances.find(
+        (i) =>
+          i.authType === "desktop" &&
+          i.accountName === account &&
+          clientCache.has(i.name),
+      );
+      if (!inst) throw new Error("no client left");
+      const client = await clientCache.get(inst.name);
+      await noPrompt.run(true, () => client.vaults.list());
+    },
+    drop: (account, why) => {
+      seen.delete(account);
+      for (const inst of instances) {
+        if (inst.accountName === account) invalidateClient(inst.name);
+      }
+      log(`${account}: ${why}`);
+    },
+  });
+
+  guarded = guardDesktopApp({
+    authorized: (account, ms) => {
+      seen.add(account);
+      keeper.used(account);
+      log(`${account}: approved after ${ms} ms, for ${asker.getStore() || "a call"}`);
+    },
+    refused: (account, ms, e) => {
+      log(
+        `${account}: not approved after ${ms} ms (${(e && e.message) || e}), for ${asker.getStore() || "a call"}`,
+      );
+    },
+    used: (account) => keeper.used(account),
+    expired: (account) => keeper.expired(account),
+  });
+
+  // The account a request reaches, for the keeper.
+  const accountOf = (msg) => {
+    const args = msg.args || {};
+    if (msg.method === "tool" && msg.name === "op_add_instance") {
+      return args.accountName;
+    }
+    const inst = getInstanceByName(
+      msg.method === "tool" ? args.instance : msg.instance,
+    );
+    return inst && inst.authType === "desktop" ? inst.accountName : undefined;
+  };
+
+  // A caller that has connected may already have handed over its request.
+  const busy = () => inFlight > 0 || (listener && listener.calls.size > 0);
+
+  const stopSoon = () => {
+    if (!busy()) leave("asked to stop");
+    else setTimeout(stopSoon, 200);
+  };
+
+  const handle = async (msg) => {
+    if (msg.method === "ping") return { ok: true };
+    if (msg.method === "stop") {
+      stopping = true;
+      setTimeout(stopSoon, 50);
+      return { ok: true };
+    }
+    inFlight++;
+    lastCallAt = Date.now();
+    keeper.wanted();
+    try {
+      reloadConfig();
+      const from = msg.from
+        ? `pid ${msg.from.pid} in ${msg.from.cwd}`
+        : "an unknown caller";
+      let text;
+      if (msg.method === "tool") {
+        if (!HANDLERS[msg.name]) {
+          return { ok: false, error: `Unknown tool: ${msg.name}` };
+        }
+        const what = `${msg.name} from ${from}`;
+        log(what);
+        text = await asker.run(what, () => runTool(msg.name, msg.args || {}));
+      } else if (msg.method === "resolve") {
+        const what = `read from ${from}`;
+        log(what);
+        text = await asker.run(what, () =>
+          readSecret(msg.instance, msg.reference),
+        );
+      } else {
+        return { ok: false, error: `Unknown request: ${msg.method}` };
+      }
+      keeper.used(accountOf(msg));
+      return { ok: true, text };
+    } catch (e) {
+      return { ok: false, error: (e && e.message) || String(e) };
+    } finally {
+      inFlight--;
+      lastCallAt = Date.now();
+    }
+  };
+
+  let ticking = false;
+  const tick = async () => {
+    if (ticking || busy() || stopping) return;
+    ticking = true;
+    try {
+      reloadConfig();
+      const holding = await keeper.tick();
+      if (busy() || stopping) return;
+      if (!holding && Date.now() - lastCallAt > LINGER_MS) {
+        leave("nothing left to keep");
+      }
+    } finally {
+      ticking = false;
+    }
+  };
+
+  try {
+    listener = await broker.serve({
+      endpoint: BROKER_ENDPOINT,
+      key: broker.loadKey(CONFIG_DIR),
+      version: PKG_VERSION,
+      handle,
+      onPresence: (sock) => {
+        chats.add(sock);
+        sock.on("close", () => chats.delete(sock));
+      },
+    });
+  } catch (e) {
+    // The name is taken: another shared process is already up, use that one.
+    if (e.code !== "EADDRINUSE" && e.code !== "EACCES") {
+      log(`could not listen: ${e.message}`);
+    }
+    process.exit(0);
+  }
+  log(
+    `started: pid ${process.pid}, v${PKG_VERSION}, guard ${guarded ? "on" : "off"}`,
+  );
+  setInterval(tick, TICK_MS);
+}
+
+// ============================================================================
+// `1password-mcp read <op://vault/item/field>`
+//
+// Prints one secret to stdout through the same shared approval, for shell
+// commands that need a value without it passing through the chat:
+//   TOKEN=$(1password-mcp read "op://Private/GitHub/token")
+// Without it a model reaches for the `op` CLI, and on Windows every `op` call
+// makes the app ask the user again.
+// ============================================================================
+
+async function readMain(argv) {
+  let instanceName;
+  let reference;
+  let newline = true;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--instance" || arg === "-i") instanceName = argv[++i];
+    else if (arg === "-n" || arg === "--no-newline") newline = false;
+    else if (reference === undefined) reference = arg;
+    else reference = null;
+  }
+  if (!reference || !reference.startsWith("op://")) {
+    console.error(
+      'Usage: 1password-mcp read [--instance <name>] [-n] "op://vault/item/field"',
+    );
+    process.exit(2);
+  }
+  reloadConfig();
+  const inst = getInstanceByName(instanceName);
+  if (!inst) {
+    throw new Error(
+      "No 1Password instance configured. Run `1password-mcp setup`.",
+    );
+  }
+  let value;
+  if (inst.authType === "desktop") {
+    const reply = await viaBroker({
+      method: "resolve",
+      instance: inst.name,
+      reference,
+    });
+    if (reply) {
+      if (!reply.ok) throw new Error(reply.error);
+      value = reply.text;
+    }
+  }
+  if (value === undefined) value = await readSecret(inst.name, reference);
+  process.stdout.write(newline ? `${value}\n` : String(value), () =>
+    process.exit(0),
+  );
+}
+
+// ============================================================================
 // MCP server wiring
 // ============================================================================
 
-const server = new Server(
-  { name: INTEGRATION_NAME, version: PKG_VERSION, icons: ICONS },
-  { capabilities: { tools: {} } },
-);
+/**
+ * What the MCP client tells the model about this server. Only for desktop-app
+ * auth: a service account never makes the app ask, so the advice against the
+ * `op` CLI would be wrong there.
+ */
+function serverInstructions() {
+  if (!instances.some((i) => i.authType === "desktop")) return undefined;
+  const read = `node "${__filename.replace(/\\/g, "/")}" read`;
+  return [
+    "# 1Password",
+    "",
+    "- Reach 1Password only through these tools. Never run the `op` CLI or the 1Password SDK from a shell or a script: each such call makes the 1Password app ask the user to approve again (on Windows with the Windows Hello or password popup, every time). These tools share one approval across all chats.",
+    `- To use a secret inside a shell command without printing it, read it through that same approval: \`${read} "op://vault/item/field"\` writes only the value to stdout (vault and item by name or id, \`--instance <name>\` for another instance). Example: \`TOKEN=$(${read} "op://Private/GitHub/token")\`.`,
+    "- Keep lookups short: op_search_items with `reveal: true` finds an item and returns its values in one call.",
+  ].join("\n");
+}
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOL_DEFINITIONS,
-}));
+let server = null;
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  const handler = HANDLERS[name];
-  if (!handler) {
-    return {
-      content: [{ type: "text", text: `Unknown tool: ${name}` }],
-      isError: true,
-    };
-  }
-  for (let attempt = 0; attempt < 2; attempt++) {
+if (IS_SERVER) {
+  const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
+  const {
+    CallToolRequestSchema,
+    ListToolsRequestSchema,
+  } = require("@modelcontextprotocol/sdk/types.js");
+
+  server = new Server(
+    { name: INTEGRATION_NAME, version: PKG_VERSION, icons: ICONS },
+    { capabilities: { tools: {} }, instructions: serverInstructions() },
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: TOOL_DEFINITIONS,
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    if (!HANDLERS[name]) {
+      return {
+        content: [{ type: "text", text: `Unknown tool: ${name}` }],
+        isError: true,
+      };
+    }
     try {
-      const result = await handler(args || {});
-      return { content: [{ type: "text", text: String(result) }] };
+      const text = await callTool(name, args || {});
+      return { content: [{ type: "text", text }] };
     } catch (e) {
-      if (attempt === 0 && isSessionError(e)) {
-        // Stale IPC connection — purge cached clients and retry once so the
-        // next getClient() call creates a fresh session.
-        clientCache.clear();
-        continue;
-      }
       return {
         content: [{ type: "text", text: `Error: ${e.message}` }],
         isError: true,
       };
     }
-  }
-});
-
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  });
 }
 
-if (require.main === module) {
+async function main() {
+  const {
+    StdioServerTransport,
+  } = require("@modelcontextprotocol/sdk/server/stdio.js");
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  // A shared process that is already up learns that this chat is here too.
+  // It is not started for this: that happens on the first call that needs it.
+  if (
+    settings.sharedApproval &&
+    instances.some((i) => i.authType === "desktop")
+  ) {
+    try {
+      holdPresence(brokerLink());
+    } catch {
+      /* the first call sorts it out */
+    }
+  }
+}
+
+if (RUN_AS === "server") {
   main().catch((e) => {
     console.error(e);
+    process.exit(1);
+  });
+} else if (RUN_AS === "broker") {
+  brokerMain().catch(() => process.exit(1));
+} else if (RUN_AS === "read") {
+  readMain(process.argv.slice(3)).catch((e) => {
+    console.error(`1password-mcp: ${(e && e.message) || e}`);
     process.exit(1);
   });
 }
@@ -1278,8 +1849,21 @@ if (typeof module !== "undefined") {
     loadConfigFile,
     saveConfigFile,
     normalizeInstance,
+    reloadConfig,
+    settings,
     // instance resolution
     getInstanceByName,
+    // running a call, and the shared approval
+    getClient,
+    clientCache,
+    callTool,
+    runTool,
+    usesDesktopApp,
+    LOCAL_TOOLS,
+    BROKER_ENDPOINT,
+    noPrompt,
+    guardDesktopApp,
+    serverInstructions,
     // helpers
     isSessionError,
     collect,
