@@ -149,6 +149,10 @@ const clientCache = new Map();
 // What each cached client was built from, so a client for an instance that
 // was since removed or pointed at another account is not reused.
 const clientAuth = new Map();
+// The newest working client per desktop account. Its session is what the
+// app's approval hangs on, so the approval is kept alive through this one
+// even after a failed call has emptied the cache above.
+const desktopClients = new Map();
 
 function authOf(instance) {
   return `${instance.authType}|${instance.accountName || ""}|${instance.token || ""}`;
@@ -233,11 +237,18 @@ async function getClient(instance) {
     clientCache.set(instance.name, pending);
     clientAuth.set(instance.name, authOf(instance));
     // A refused or failed approval must not stick: the next call asks again.
-    pending.catch(() => {
-      if (clientCache.get(instance.name) === pending) {
-        invalidateClient(instance.name);
-      }
-    });
+    pending.then(
+      (client) => {
+        if (instance.authType === "desktop") {
+          desktopClients.set(instance.accountName, client);
+        }
+      },
+      () => {
+        if (clientCache.get(instance.name) === pending) {
+          invalidateClient(instance.name);
+        }
+      },
+    );
   }
   return pending;
 }
@@ -1620,18 +1631,18 @@ async function brokerMain() {
     inUse: () => chats.size > 0,
     keepAuthorized: () => settings.keepAuthorized,
     ping: async (account) => {
-      const inst = instances.find(
-        (i) =>
-          i.authType === "desktop" &&
-          i.accountName === account &&
-          clientCache.has(i.name),
+      // Not the cache: a call that failed on a passing IPC error empties it,
+      // and the approval would then be given up although it is still good.
+      const client = desktopClients.get(account);
+      const configured = instances.some(
+        (i) => i.authType === "desktop" && i.accountName === account,
       );
-      if (!inst) throw new Error("no client left");
-      const client = await clientCache.get(inst.name);
+      if (!client || !configured) throw new Error("no client left");
       await noPrompt.run(true, () => client.vaults.list());
     },
     drop: (account, why) => {
       seen.delete(account);
+      desktopClients.delete(account);
       for (const inst of instances) {
         if (inst.accountName === account) invalidateClient(inst.name);
       }
